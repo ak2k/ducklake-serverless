@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Build / dist
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / type / lint caches
+.pytest_cache/
+.ruff_cache/
+.basedpyright/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# uv / venv
+.venv/
+
+# Env
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
