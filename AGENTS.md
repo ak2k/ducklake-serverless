@@ -20,7 +20,13 @@ Protocol invariants agents must not weaken (see `docs/` and the plan):
 - Only blind appends auto-replay on conflict; state-dependent DML aborts unless
   the caller opted into `replay_all`.
 - Version fields in the root doc gate commits; auto-migration of the catalog
-  format is forbidden.
+  format is forbidden — BOTH pins are enforced: duckdb_storage_version before
+  attach, ducklake_format_version before publish.
+- GC never deletes the current generation or any generation inside the
+  retention window; readers pinned to retained generations survive GC.
+- S3 clients MUST disable transport retries (`make_s3_client`) — an SDK-level
+  retry of a conditional PUT can 412 against our own successful write,
+  masking a committed transaction as a lost race.
 
 ## Stack (one per concern; substitutes are bans)
 

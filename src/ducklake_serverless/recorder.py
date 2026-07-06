@@ -31,8 +31,11 @@ VOLATILE_FUNCTIONS = frozenset(
     {
         "now",
         "current_timestamp",
+        "get_current_timestamp",
+        "transaction_timestamp",
         "current_date",
         "current_time",
+        "get_current_time",
         "current_localtime",
         "current_localtimestamp",
         "today",
@@ -43,18 +46,25 @@ VOLATILE_FUNCTIONS = frozenset(
         "uuidv4",
         "uuidv7",
         "nextval",
+        "getenv",
+        "current_setting",
     }
 )
 
-# Table functions that read sources OUTSIDE the lake (staged files). An
-# INSERT…SELECT over only these is still a blind append.
-_NON_LAKE_SOURCES = frozenset(
+# ALLOWLIST of table functions whose replay reads the same immutable bytes
+# (staged files). Any OTHER function used as a relation source — including
+# live external readers like postgres_scan/sqlite_scan — makes the insert
+# state-dependent: replay would re-read a source that may have changed.
+_STAGED_FILE_SOURCES = frozenset(
     {
         "read_parquet",
         "read_csv",
         "read_csv_auto",
         "read_json",
         "read_json_auto",
+        "read_json_objects",
+        "read_ndjson",
+        "read_ndjson_auto",
         "parquet_scan",
     }
 )
@@ -67,6 +77,23 @@ def _function_names(tree: Expr) -> set[str]:
             names.add(func.name.lower())
         else:
             names.add(func.sql_name().lower())
+    return names
+
+
+def _relation_functions(tree: Expr) -> set[str]:
+    """Function names used as relation sources (FROM read_parquet(...) etc.).
+
+    Scalar functions in expressions never appear here — only functions
+    wrapped in a Table node, i.e. actually read as a data source.
+    """
+    names: set[str] = set()
+    for tbl in tree.find_all(exp.Table):
+        func = tbl.this  # pyright: ignore[reportAny]  # sqlglot nodes are untyped
+        if isinstance(func, exp.Func):
+            if isinstance(func, exp.Anonymous):
+                names.add(func.name.lower())
+            else:
+                names.add(func.sql_name().lower())
     return names
 
 
@@ -111,16 +138,19 @@ def classify(sql: str) -> StatementClass:  # noqa: PLR0911  # decision table: on
     if isinstance(tree, (exp.Update, exp.Delete, exp.Merge)):
         return StatementClass.STATE_DEPENDENT_DML
     if isinstance(tree, exp.Insert):
+        # Upsert shapes (INSERT OR REPLACE / OR IGNORE, ON CONFLICT) read
+        # existing rows to decide what to write — replay clobbers concurrent
+        # writers. RETURNING's first-execution results were already consumed
+        # by the caller; a replay silently diverges from them.
+        if tree.args.get("alternative") or tree.args.get("conflict") or tree.args.get("returning"):
+            return StatementClass.STATE_DEPENDENT_DML
         if _reads_lake_tables(tree):
             return StatementClass.STATE_DEPENDENT_DML
-        func_names = _function_names(tree)
-        unknown_table_funcs = func_names - _NON_LAKE_SOURCES
-        # Pure VALUES or SELECT over staged files only: safe to replay.
-        if not unknown_table_funcs or all(
-            not name.startswith("read_") for name in unknown_table_funcs
-        ):
-            return StatementClass.BLIND_APPEND
-        return StatementClass.STATE_DEPENDENT_DML
+        if _relation_functions(tree) - _STAGED_FILE_SOURCES:
+            # Unknown relation source (postgres_scan, iceberg_scan, …):
+            # replay re-reads live external state — not a blind append.
+            return StatementClass.STATE_DEPENDENT_DML
+        return StatementClass.BLIND_APPEND
     if isinstance(tree, exp.Select):
         return StatementClass.READ
     # Anything unrecognized: the conservative bucket.

@@ -5,6 +5,8 @@ Never catch and re-raise external library exceptions unchanged — wrap them
 in a domain error so callers can match on intent, not library identity.
 """
 
+from __future__ import annotations
+
 
 class AppError(Exception):
     """Base class for all application errors."""

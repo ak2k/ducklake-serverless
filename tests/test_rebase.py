@@ -63,7 +63,7 @@ def test_state_dependent_dml_never_replays_by_default(
 
 
 def test_blind_appends_replay_under_default_policy() -> None:
-    changeset = make_changeset(StatementClass.BLIND_APPEND, StatementClass.READ)
+    changeset = make_changeset(StatementClass.BLIND_APPEND, StatementClass.BLIND_APPEND)
     decision = decide_rebase(
         changeset, ConflictPolicy.APPEND_ONLY_REPLAY, attempt=1, max_attempts=5
     )
@@ -81,3 +81,21 @@ def test_empty_changeset_aborts() -> None:
         Changeset(statements=()), ConflictPolicy.REPLAY_ALL, attempt=1, max_attempts=5
     )
     assert isinstance(decision, Abort)
+
+
+def test_read_plus_append_aborts_under_default_policy() -> None:
+    """A recorded READ means later writes may depend on stale state —
+
+    replaying only the writes launders write skew through the append path.
+    """
+    changeset = make_changeset(StatementClass.READ, StatementClass.BLIND_APPEND)
+    decision = decide_rebase(
+        changeset, ConflictPolicy.APPEND_ONLY_REPLAY, attempt=1, max_attempts=5
+    )
+    assert isinstance(decision, Abort)
+
+
+def test_read_plus_append_replays_under_replay_all() -> None:
+    changeset = make_changeset(StatementClass.READ, StatementClass.BLIND_APPEND)
+    decision = decide_rebase(changeset, ConflictPolicy.REPLAY_ALL, attempt=1, max_attempts=5)
+    assert isinstance(decision, Replay)

@@ -76,3 +76,36 @@ def test_multi_statement_rejected() -> None:
 def test_unparseable_rejected() -> None:
     with pytest.raises(InputValidationError, match="parse"):
         classify("THIS IS NOT SQL AT (((")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT OR REPLACE INTO t VALUES (1)",
+        "INSERT OR IGNORE INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (1) ON CONFLICT DO UPDATE SET v = 2",
+        "INSERT INTO t VALUES (1) RETURNING *",
+        "INSERT INTO t SELECT * FROM postgres_scan('h', 'd', 't')",
+        "INSERT INTO t SELECT * FROM sqlite_scan('f.db', 't')",
+    ],
+)
+def test_upserts_and_external_scans_are_state_dependent(sql: str) -> None:
+    """Upsert shapes read existing rows to decide writes; external scans
+
+    re-read live sources on replay. Neither is a blind append.
+    """
+    assert classify(sql) is StatementClass.STATE_DEPENDENT_DML
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO t VALUES (get_current_timestamp())",
+        "INSERT INTO t VALUES (transaction_timestamp())",
+        "INSERT INTO t SELECT getenv('HOME')",
+    ],
+)
+def test_volatile_aliases_rejected(sql: str) -> None:
+    with pytest.raises(InputValidationError, match="volatile"):
+        classify(sql)

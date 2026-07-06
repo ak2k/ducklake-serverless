@@ -135,16 +135,19 @@ class Lake:
         connection = LakeConnection(catalog_path, self._data_path)
         connection.close()
 
-        publish_generation(self._store, catalog_path, 0, catalog_uuid)
-        doc = RootDoc(
-            generation=0,
-            catalog_uuid=catalog_uuid,
-            duckdb_storage_version=DUCKDB_VERSION,
-            ducklake_format_version=probe_ducklake_format_version(catalog_path),
-            created_at=datetime.now(tz=UTC),
-            writer=_writer_info(),
-        )
-        bootstrap_root(self._store, doc)
+        try:
+            publish_generation(self._store, catalog_path, 0, catalog_uuid)
+            doc = RootDoc(
+                generation=0,
+                catalog_uuid=catalog_uuid,
+                duckdb_storage_version=DUCKDB_VERSION,
+                ducklake_format_version=probe_ducklake_format_version(catalog_path),
+                created_at=datetime.now(tz=UTC),
+                writer=_writer_info(),
+            )
+            bootstrap_root(self._store, doc)
+        finally:
+            GenerationCache.discard(catalog_path)
         return doc
 
     @contextmanager
@@ -163,16 +166,33 @@ class Lake:
             yield transaction
         except BaseException:
             connection.abandon()
+            GenerationCache.discard(work)
             raise
         connection.close()
 
-        self._commit(work, base, etag, transaction.changeset)
+        try:
+            self._commit(work, base, etag, transaction.changeset)
+        finally:
+            GenerationCache.discard(work)
 
     def _commit(self, work: Path, base: RootDoc, etag: str, changeset: Changeset) -> CommitResult:
         """Publish + CAS, replaying onto newer generations until won or aborted."""
         attempt = 0
         while True:
             new_uuid = uuid4()
+            # The ATTACH that ran this transaction may have silently
+            # auto-migrated the catalog format (newer ducklake extension).
+            # The duckdb-version pin cannot catch that — the extension
+            # versions independently — so probe the file itself and refuse
+            # to publish a migrated catalog to the fleet.
+            work_format = probe_ducklake_format_version(work)
+            if work_format != base.ducklake_format_version:
+                raise VersionMismatchError(
+                    f"local ducklake extension migrated the catalog format "
+                    f"({base.ducklake_format_version} -> {work_format}); "
+                    "publishing would break other readers. Upgrade the lake "
+                    "explicitly instead."
+                )
             publish_generation(self._store, work, base.generation + 1, new_uuid)
             new_doc = base.model_copy(
                 update={
@@ -190,8 +210,11 @@ class Lake:
                     attempts=attempt + 1,
                 )
             except (PreconditionFailedError, ConditionalConflictError):
-                base, etag = read_root(self._store)
-            except AmbiguousCasError:
+                # A 412/409 can be our OWN successful write echoed back: an
+                # SDK-level transport retry of a conditional PUT that landed
+                # 412s against itself. Resolve by commit token before
+                # concluding someone else won — otherwise this would replay
+                # an already-committed changeset (double-apply).
                 outcome, current, current_etag = resolve_cas(self._store, new_uuid)
                 if outcome is CasOutcome.WON:
                     return CommitResult(
@@ -200,6 +223,23 @@ class Lake:
                         attempts=attempt + 1,
                     )
                 base, etag = current, current_etag
+            except AmbiguousCasError:
+                outcome, current, current_etag = resolve_cas(self._store, new_uuid)
+                if outcome is CasOutcome.WON:
+                    return CommitResult(
+                        generation=current.generation,
+                        catalog_uuid=new_uuid,
+                        attempts=attempt + 1,
+                    )
+                # LOST after an ambiguous outcome is unresolvable: our write
+                # may have landed and been built upon before this re-read —
+                # any successor destroys the uuid evidence. Replaying could
+                # double-apply; the only safe exit is abort.
+                raise ConflictAbortError(
+                    "commit outcome ambiguous and the root has moved on — the "
+                    "write may or may not be committed. Verify lake state "
+                    "before retrying this transaction."
+                ) from None
 
             while True:
                 attempt += 1
@@ -210,12 +250,15 @@ class Lake:
                     raise ConflictAbortError(decision.reason)
                 _backoff(attempt)
                 try:
-                    work = self._replay(base, changeset)
-                    break
+                    replayed = self._replay(base, changeset)
                 except ObjectNotFoundError:
                     # GC swept the base between our root read and the fetch —
                     # the root has necessarily advanced; rebase onto current.
                     base, etag = read_root(self._store)
+                else:
+                    GenerationCache.discard(work)
+                    work = replayed
+                    break
 
     def _replay(self, winner: RootDoc, changeset: Changeset) -> Path:
         """Re-execute the changeset against a fresh copy of the winner's catalog."""
@@ -227,6 +270,7 @@ class Lake:
                 connection.execute(statement.sql, statement.params)
         except BaseException:
             connection.abandon()
+            GenerationCache.discard(work)
             raise
         connection.close()
         return work
@@ -260,6 +304,7 @@ class Lake:
             yield connection
         finally:
             connection.abandon()
+            GenerationCache.discard(path)
 
     def _check_versions(self, root: RootDoc) -> None:
         """Refuse to write when local versions differ from the lake's pins.

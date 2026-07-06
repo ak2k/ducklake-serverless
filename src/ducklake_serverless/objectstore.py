@@ -8,6 +8,7 @@ protocol rests on.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol
@@ -24,6 +25,27 @@ from ducklake_serverless.errors import (
 
 if TYPE_CHECKING:
     from mypy_boto3_s3.client import S3Client
+
+
+def make_s3_client(endpoint_url: str | None = None, region_name: str | None = None) -> S3Client:
+    """Create an S3 client with transport retries DISABLED — required.
+
+    botocore's default retry modes transparently re-send PUTs on 5xx and
+    socket timeouts, including conditional PUTs. A retried conditional PUT
+    whose first attempt landed 412s against our own write, surfacing a
+    definitive-looking PreconditionFailedError for a commit that actually
+    succeeded. With retries off, transport failures surface as
+    AmbiguousCasError and resolve via the commit token instead.
+    """
+    import boto3  # noqa: PLC0415  # optional import: only S3-backed stores need boto3
+    from botocore.config import Config  # noqa: PLC0415
+
+    return boto3.client(  # pyright: ignore[reportUnknownMemberType, reportReturnType]
+        "s3",
+        endpoint_url=endpoint_url,
+        region_name=region_name,
+        config=Config(retries={"max_attempts": 1}),
+    )
 
 
 @dataclass(frozen=True)
@@ -161,11 +183,17 @@ class S3ObjectStore:
 
 
 class InMemoryObjectStore:
-    """Deterministic fake for unit and stateful property tests."""
+    """Deterministic fake for unit and stateful property tests.
+
+    A lock makes the conditional writes genuinely atomic under threads —
+    real S3 serializes each request server-side, and the torture tests'
+    exactly-once invariant is only meaningful if the fake does too.
+    """
 
     def __init__(self) -> None:
         self._objects: dict[str, tuple[bytes, str]] = {}
         self._etag_counter = 0
+        self._lock = threading.Lock()
 
     def _next_etag(self) -> str:
         self._etag_counter += 1
@@ -173,36 +201,41 @@ class InMemoryObjectStore:
 
     def get(self, key: str) -> GetResult:
         """Fetch an object body and its ETag."""
-        try:
-            body, etag = self._objects[key]
-        except KeyError:
-            raise ObjectNotFoundError(key) from None
-        return GetResult(body=body, etag=etag)
+        with self._lock:
+            try:
+                body, etag = self._objects[key]
+            except KeyError:
+                raise ObjectNotFoundError(key) from None
+            return GetResult(body=body, etag=etag)
 
     def put_if_absent(self, key: str, body: bytes) -> str:
         """Create-only PUT; fails if the key already exists."""
-        if key in self._objects:
-            raise PreconditionFailedError(key)
-        etag = self._next_etag()
-        self._objects[key] = (body, etag)
-        return etag
+        with self._lock:
+            if key in self._objects:
+                raise PreconditionFailedError(key)
+            etag = self._next_etag()
+            self._objects[key] = (body, etag)
+            return etag
 
     def put_if_match(self, key: str, body: bytes, etag: str) -> str:
         """Conditional overwrite; matches real-S3 404/412 semantics."""
-        current = self._objects.get(key)
-        if current is None:
-            # Match real S3: If-Match against a missing key is 404, not 412.
-            raise ObjectNotFoundError(key)
-        if current[1] != etag:
-            raise PreconditionFailedError(key)
-        new_etag = self._next_etag()
-        self._objects[key] = (body, new_etag)
-        return new_etag
+        with self._lock:
+            current = self._objects.get(key)
+            if current is None:
+                # Match real S3: If-Match against a missing key is 404, not 412.
+                raise ObjectNotFoundError(key)
+            if current[1] != etag:
+                raise PreconditionFailedError(key)
+            new_etag = self._next_etag()
+            self._objects[key] = (body, new_etag)
+            return new_etag
 
     def list_prefix(self, prefix: str) -> list[str]:
         """List keys under a prefix, sorted for determinism."""
-        return sorted(k for k in self._objects if k.startswith(prefix))
+        with self._lock:
+            return sorted(k for k in self._objects if k.startswith(prefix))
 
     def delete(self, key: str) -> None:
         """Delete an object (idempotent)."""
-        self._objects.pop(key, None)
+        with self._lock:
+            self._objects.pop(key, None)

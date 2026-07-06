@@ -11,7 +11,9 @@ bytes, or an implausible size must never reach the bucket.
 from __future__ import annotations
 
 import shutil
+from collections import OrderedDict
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 from ducklake_serverless.engine import MAGIC, MAGIC_OFFSET
 from ducklake_serverless.errors import CatalogHygieneError
@@ -28,13 +30,23 @@ if TYPE_CHECKING:
 MAX_CATALOG_BYTES = 256 * 1024 * 1024
 
 
+# Pristine copies kept on disk; enough for hot rebase traffic, small enough
+# that a long-lived writer's workdir stays bounded.
+PRISTINE_CACHE_SIZE = 4
+
+
 class GenerationCache:
-    """Fetches catalog generations into a local directory and vends copies."""
+    """Fetches catalog generations into a local directory and vends copies.
+
+    Pristine originals are LRU-bounded; work copies are uniquely named per
+    call (two transactions on the same base must never share a file) and
+    released with `discard` once their transaction commits or aborts.
+    """
 
     def __init__(self, store: ObjectStore, workdir: Path) -> None:
         self._store = store
         self._workdir = workdir
-        self._pristine: dict[str, Path] = {}
+        self._pristine: OrderedDict[str, Path] = OrderedDict()
 
     def fetch_copy(self, generation: int, catalog_uuid: UUID) -> Path:
         """Return a private, mutable copy of the given generation's catalog."""
@@ -45,9 +57,19 @@ class GenerationCache:
             pristine = self._workdir / f"pristine-{generation:08d}-{catalog_uuid}.duckdb"
             pristine.write_bytes(result.body)
             self._pristine[key] = pristine
-        copy = self._workdir / f"work-{generation:08d}-{catalog_uuid}.duckdb"
+        self._pristine.move_to_end(key)
+        while len(self._pristine) > PRISTINE_CACHE_SIZE:
+            _, evicted = self._pristine.popitem(last=False)
+            evicted.unlink(missing_ok=True)
+        copy = self._workdir / f"work-{uuid4()}.duckdb"
         shutil.copyfile(pristine, copy)
         return copy
+
+    @staticmethod
+    def discard(work_copy: Path) -> None:
+        """Delete a work copy (and any WAL sidecar) once its transaction ends."""
+        work_copy.unlink(missing_ok=True)
+        work_copy.with_name(work_copy.name + ".wal").unlink(missing_ok=True)
 
 
 def check_hygiene(catalog_path: Path) -> None:

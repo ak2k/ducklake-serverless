@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from ducklake_serverless.models import Changeset
 
 
-def decide_rebase(
+def decide_rebase(  # noqa: PLR0911  # decision table: one return per rule
     changeset: Changeset,
     policy: ConflictPolicy,
     attempt: int,
@@ -53,5 +53,16 @@ def decide_rebase(
             reason="changeset contains state-dependent DML (UPDATE/DELETE/"
             "lake-reading INSERT) — re-execution against unseen state is "
             "write skew; re-read and re-decide, or opt into replay_all"
+        )
+    if changeset.has_reads and policy is not ConflictPolicy.REPLAY_ALL:
+        # The caller read lake state in this transaction; its appends may
+        # encode decisions from that read (SELECT max(id) -> INSERT literal).
+        # Replaying only the writes against newer state launders write skew
+        # through the blind-append path — the same dependency expressed as
+        # one INSERT…SELECT would already abort.
+        return Abort(
+            reason="changeset mixes reads with writes — the writes may depend "
+            "on state a replay target no longer has; re-read and re-decide, "
+            "or opt into replay_all"
         )
     return Replay()

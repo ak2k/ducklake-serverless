@@ -3,9 +3,11 @@
 **Multi-writer [DuckLake](https://ducklake.select/) with no catalog server — the
 entire lakehouse, catalog included, lives in one object-storage bucket.**
 
-> Status: early development. The commit protocol core (P0) exists; the
-> transaction envelope, rebase, and GC are being built. Not affiliated with
-> DuckDB Labs or the DuckLake project.
+> Status: early development. The commit protocol, transaction envelope,
+> rebase-on-conflict, and lease-guarded GC are implemented and tested
+> (including live against iDrive E2); DuckLake snapshot expiry / orphan
+> Parquet cleanup and the MinIO integration lane are still pending. Not
+> affiliated with DuckDB Labs or the DuckLake project.
 
 ## The idea
 
@@ -47,6 +49,33 @@ DuckLake format:
 The root doc also pins the DuckDB storage version and DuckLake format version:
 a writer with mismatched local versions refuses to commit rather than silently
 auto-migrating the catalog for the whole fleet. Upgrades are explicit.
+
+## Usage
+
+```python
+from pathlib import Path
+from ducklake_serverless.objectstore import S3ObjectStore, make_s3_client
+from ducklake_serverless.session import Lake
+
+client = make_s3_client(endpoint_url="https://<s3-compatible-endpoint>")
+store = S3ObjectStore(client, "my-bucket", prefix="lake")
+lake = Lake(store, workdir=Path("/tmp/lake-work"), data_path="s3://my-bucket/lake/data")
+
+lake.bootstrap()                       # once, creates generation 0 + root
+
+with lake.transaction() as tx:         # concurrent writers just do this
+    tx.sql("CREATE TABLE events (id INTEGER, msg VARCHAR)")
+
+with lake.transaction() as tx:
+    tx.sql("INSERT INTO events VALUES (?, ?)", (1, "hello"))
+
+with lake.reader() as con:             # readers: stock frozen-DuckLake attach
+    print(con.execute("SELECT * FROM events"))
+```
+
+Always create S3 clients with `make_s3_client` — it disables botocore's
+transport retries, which would otherwise silently re-send conditional PUTs
+and corrupt the commit protocol's conflict detection.
 
 ## Development
 

@@ -24,10 +24,19 @@ _CATALOG_KEY_RE = re.compile(
 )
 
 
+MAX_GENERATION = 10**8 - 1  # the key format zero-pads to exactly 8 digits
+
+
 def format_catalog_key(generation: int, catalog_uuid: UUID) -> str:
     """Canonical object key for a catalog generation."""
     if generation < 0:
         raise InputValidationError(f"generation must be >= 0, got {generation}")
+    if generation > MAX_GENERATION:
+        # Beyond 8 digits the key would format but never parse back —
+        # GC would silently stop sweeping. Fail loudly at the source.
+        raise InputValidationError(
+            f"generation {generation} exceeds the 8-digit key format (max {MAX_GENERATION})"
+        )
     return f"{CATALOG_PREFIX}cat-{generation:08d}-{catalog_uuid}.duckdb"
 
 
@@ -61,7 +70,7 @@ class RootDoc(BaseModel):
     schema_id: Literal["ducklake-serverless-root/1"] = Field(
         default="ducklake-serverless-root/1", alias="schema"
     )
-    generation: int = Field(ge=0)
+    generation: int = Field(ge=0, le=MAX_GENERATION)
     catalog_uuid: UUID
     duckdb_storage_version: str
     ducklake_format_version: str
@@ -114,6 +123,16 @@ class Changeset(BaseModel):
     def has_ddl(self) -> bool:
         """Whether any statement is DDL (always aborts on conflict)."""
         return any(s.statement_class is StatementClass.DDL for s in self.statements)
+
+    @property
+    def has_reads(self) -> bool:
+        """Whether the transaction read lake state before writing.
+
+        A recorded READ means the caller's later writes may encode decisions
+        derived from state that a replay target no longer has — replaying
+        the writes alone launders write skew through the append path.
+        """
+        return any(s.statement_class is StatementClass.READ for s in self.statements)
 
     @property
     def is_blind_append_only(self) -> bool:
