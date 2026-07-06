@@ -11,11 +11,6 @@ do not edit by hand.
 
 | Backend | Version | Conditional writes | Last verified | Provenance |
 |---|---|---|---|---|
-| MinIO | `RELEASE.2025-09-07 (nixpkgs local)` | ✅ enforces | 2026-07-06 | local probe (CI re-verifies weekly) |
-| SeaweedFS | `4.36 (nixpkgs local)` | ✅ enforces | 2026-07-06 | local probe (CI re-verifies weekly) |
-| moto | `5.2.2` | ✅ enforces | 2026-07-06 | local probe (CI re-verifies weekly) |
-| garage | `1.3.1 (nixpkgs local)` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-06 | local probe (CI re-verifies weekly) |
-| rclone serve s3 | `1.74 (nixpkgs local)` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-06 | local probe (CI re-verifies weekly) |
 | AWS S3 | `(service)` | ✅ enforces | 2024-11-25 | AWS launch announcement + delta-rs production use |
 | iDrive E2 | `(service)` | ✅ enforces | 2026-07-05 | manual probe (undocumented by iDrive; verified empirically) |
 
