@@ -113,9 +113,14 @@
 
             # uv's bundled python-build-standalone won't link on NixOS;
             # force the Nix-managed interpreter. No-op on Darwin.
+            # LD_LIBRARY_PATH: the manylinux duckdb wheel dlopens
+            # libstdc++.so.6, which nix shells don't expose by default.
             shellHook = ''
               export UV_PYTHON=${python}/bin/python3
               export UV_PYTHON_PREFERENCE=only-system
+              ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+                export LD_LIBRARY_PATH=${pkgs.stdenv.cc.cc.lib}/lib''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+              ''}
               echo "🐍 python: $(python3 --version)"
               echo "📦 uv:     $(uv --version)"
             '';
