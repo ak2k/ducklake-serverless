@@ -77,3 +77,18 @@ def test_exactly_one_winner_among_contenders() -> None:
     leases = [Lease(store, f"w{i}", ttl_seconds=60) for i in range(10)]
     winners = [lease for lease in leases if lease.acquire()]
     assert len(winners) == 1
+
+
+def test_release_is_atomic_tombstone_not_delete() -> None:
+    """release() must never remove a successor's live lease (the old
+
+    check-then-delete had that race); it tombstones its own lease instead.
+    """
+    store = InMemoryObjectStore()
+    lease = Lease(store, "a", ttl_seconds=60)
+    assert lease.acquire()
+    lease.release()
+    # The key still exists (tombstoned, expired) — and is acquirable.
+    body: dict[str, object] = json.loads(store.get(LEASE_KEY).body)  # pyright: ignore[reportAny]
+    assert body["expires_at"] == 0.0
+    assert Lease(store, "b", ttl_seconds=60).acquire()

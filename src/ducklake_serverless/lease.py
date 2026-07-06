@@ -7,12 +7,14 @@ not block forever. Expiry is computed from the store's LastModified-style
 server time... except ObjectStore has no timestamps, so the lease body
 carries an `expires_at` epoch written by the holder. Clock skew between
 maintenance hosts therefore erodes the guarantee at the margin — TTLs
-should be minutes, not milliseconds, and GC must remain safe even if two
-runners briefly overlap (it is: every mutation goes through CAS).
+should be minutes, not milliseconds, and lease consumers must stay safe
+under brief holder overlap (GC is: swept keys are immutable garbage, so
+overlapping sweeps are idempotent — see gc.py's module docstring).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from typing import TYPE_CHECKING
@@ -88,16 +90,21 @@ class Lease:
         return True
 
     def release(self) -> None:
-        """Give the lease up. Only deletes if we still hold it."""
+        """Give the lease up by tombstoning it (atomic, never delete).
+
+        A check-then-delete could remove a successor's live lease taken
+        over between the check and the delete. Overwriting our own lease
+        with an already-expired body via If-Match is atomic: it succeeds
+        only while we still hold it, and the tombstone is immediately
+        acquirable by anyone.
+        """
         if self._etag is None:
             return
-        try:
-            current = self._store.get(self._key)
-        except ObjectNotFoundError:
-            self._etag = None
-            return
-        if current.etag == self._etag:
-            self._store.delete(self._key)
+        tombstone = json.dumps({"holder": self._holder, "expires_at": 0.0}).encode()
+        with contextlib.suppress(
+            PreconditionFailedError, ConditionalConflictError, ObjectNotFoundError
+        ):  # a successor already took over — nothing of ours to release
+            self._store.put_if_match(self._key, tombstone, self._etag)
         self._etag = None
 
 

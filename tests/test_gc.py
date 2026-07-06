@@ -7,11 +7,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from ducklake_serverless.engine import LakeConnection
+from ducklake_serverless.errors import ExternalServiceError
 from ducklake_serverless.gc import collect
 from ducklake_serverless.lease import Lease
 from ducklake_serverless.models import parse_catalog_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
-from ducklake_serverless.root import read_root
+from ducklake_serverless.root import publish_root, read_root
 from ducklake_serverless.session import Lake
 
 if TYPE_CHECKING:
@@ -121,3 +122,35 @@ def test_reader_pinned_inside_window_survives_gc(
     rows = con.execute("SELECT count(*) FROM t")
     assert rows == [(5,)]  # the state as of the pinned generation
     con.abandon()
+
+
+def test_sweep_refuses_when_root_names_missing_catalog(
+    lake: Lake, store: InMemoryObjectStore
+) -> None:
+    """A root pointing at a nonexistent catalog means the listing (or the
+
+    root) cannot be trusted — non-dry-run must refuse, not sweep.
+    """
+    setup_lake_with_history(lake, commits=3)
+    current, _ = read_root(store)
+    store.delete(current.catalog_key)  # simulate corruption/partial listing
+
+    with pytest.raises(ExternalServiceError, match="refusing to sweep"):
+        collect(store, "gc-test", retain_generations=1, dry_run=False)
+
+
+def test_sweep_refuses_absurd_root_generation(lake: Lake, store: InMemoryObjectStore) -> None:
+    """A corrupt root with a generation beyond every listed catalog must
+
+    degrade to keep-everything, never amplify into mass deletion.
+    """
+    setup_lake_with_history(lake, commits=3)
+    doc, etag = read_root(store)
+    absurd = doc.model_copy(update={"generation": doc.generation + 1000})
+    # Publish the absurd root; its catalog_key names nothing in the listing.
+    publish_root(store, absurd, etag)
+
+    before = set(store.list_prefix("catalog/"))
+    with pytest.raises(ExternalServiceError, match="refusing to sweep"):
+        collect(store, "gc-test", retain_generations=1, dry_run=False)
+    assert set(store.list_prefix("catalog/")) == before  # nothing deleted

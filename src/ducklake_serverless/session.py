@@ -18,7 +18,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from ducklake_serverless import __version__
 from ducklake_serverless.engine import (
@@ -44,6 +44,7 @@ from ducklake_serverless.models import (
     RootDoc,
     Statement,
     WriterInfo,
+    format_catalog_key,
 )
 from ducklake_serverless.rebase import decide_rebase
 from ducklake_serverless.recorder import record
@@ -151,6 +152,22 @@ class Lake:
         return doc
 
     @contextmanager
+    def _writable_copy(self, work: Path) -> Generator[LakeConnection]:
+        """Attach a work copy for writing; abandon+discard it on any failure.
+
+        On success the connection is closed (checkpointing the file) and the
+        work copy is left on disk for the caller to publish and discard.
+        """
+        connection = LakeConnection(work, self._data_path)
+        try:
+            yield connection
+        except BaseException:
+            connection.abandon()
+            GenerationCache.discard(work)
+            raise
+        connection.close()
+
+    @contextmanager
     def transaction(self) -> Generator[Transaction]:
         """Run SQL against the lake and commit it as one new generation.
 
@@ -160,40 +177,63 @@ class Lake:
         local versions differ from the lake's pins.
         """
         base, etag, work = self._fetch_current_base()
-        connection = LakeConnection(work, self._data_path)
-        transaction = Transaction(connection)
-        try:
+        with self._writable_copy(work) as connection:
+            transaction = Transaction(connection)
             yield transaction
-        except BaseException:
-            connection.abandon()
-            GenerationCache.discard(work)
-            raise
-        connection.close()
 
         try:
             self._commit(work, base, etag, transaction.changeset)
         finally:
             GenerationCache.discard(work)
 
+    def _check_format_unmigrated(self, work: Path, base: RootDoc) -> None:
+        """Refuse to publish a catalog whose format was migrated on ATTACH.
+
+        A newer ducklake extension silently rewrites the catalog format when
+        it attaches; the duckdb-version pin cannot catch that — the extension
+        versions independently — so probe the file itself before it ships.
+        """
+        work_format = probe_ducklake_format_version(work)
+        if work_format != base.ducklake_format_version:
+            raise VersionMismatchError(
+                f"local ducklake extension migrated the catalog format "
+                f"({base.ducklake_format_version} -> {work_format}); "
+                "publishing would break other readers. Upgrade the lake "
+                "explicitly instead."
+            )
+
+    def _publish_generation_resolved(
+        self, work: Path, generation: int, new_uuid: UUID, attempt: int
+    ) -> bool:
+        """Upload a catalog generation, resolving ambiguous outcomes.
+
+        The upload is create-only to a unique immutable key, so ambiguity
+        resolves with one GET: present means it landed. Returns False when
+        the upload definitively did not land (caller retries with backoff).
+        """
+        try:
+            publish_generation(self._store, work, generation, new_uuid)
+        except AmbiguousCasError:
+            try:
+                self._store.get(format_catalog_key(generation, new_uuid))
+            except ObjectNotFoundError:
+                if attempt + 1 >= self._max_attempts:
+                    raise ConflictAbortError(
+                        f"catalog upload kept failing across {self._max_attempts} attempts"
+                    ) from None
+                return False
+        return True
+
     def _commit(self, work: Path, base: RootDoc, etag: str, changeset: Changeset) -> CommitResult:
         """Publish + CAS, replaying onto newer generations until won or aborted."""
         attempt = 0
         while True:
             new_uuid = uuid4()
-            # The ATTACH that ran this transaction may have silently
-            # auto-migrated the catalog format (newer ducklake extension).
-            # The duckdb-version pin cannot catch that — the extension
-            # versions independently — so probe the file itself and refuse
-            # to publish a migrated catalog to the fleet.
-            work_format = probe_ducklake_format_version(work)
-            if work_format != base.ducklake_format_version:
-                raise VersionMismatchError(
-                    f"local ducklake extension migrated the catalog format "
-                    f"({base.ducklake_format_version} -> {work_format}); "
-                    "publishing would break other readers. Upgrade the lake "
-                    "explicitly instead."
-                )
-            publish_generation(self._store, work, base.generation + 1, new_uuid)
+            self._check_format_unmigrated(work, base)
+            if not self._publish_generation_resolved(work, base.generation + 1, new_uuid, attempt):
+                attempt += 1
+                _backoff(attempt)
+                continue
             new_doc = base.model_copy(
                 update={
                     "generation": base.generation + 1,
@@ -264,15 +304,9 @@ class Lake:
         """Re-execute the changeset against a fresh copy of the winner's catalog."""
         self._check_versions(winner)
         work = self._cache.fetch_copy(winner.generation, winner.catalog_uuid)
-        connection = LakeConnection(work, self._data_path)
-        try:
+        with self._writable_copy(work) as connection:
             for statement in changeset.statements:
                 connection.execute(statement.sql, statement.params)
-        except BaseException:
-            connection.abandon()
-            GenerationCache.discard(work)
-            raise
-        connection.close()
         return work
 
     def _fetch_current_base(self) -> tuple[RootDoc, str, Path]:
