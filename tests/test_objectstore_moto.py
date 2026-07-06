@@ -10,14 +10,22 @@ support).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, override
 
 import boto3
 import pytest
 from moto import mock_aws
 
-from ducklake_serverless.errors import ObjectNotFoundError, PreconditionFailedError
-from ducklake_serverless.objectstore import S3ObjectStore
+from ducklake_serverless.errors import (
+    ExternalServiceError,
+    ObjectNotFoundError,
+    PreconditionFailedError,
+)
+from ducklake_serverless.objectstore import (
+    InMemoryObjectStore,
+    S3ObjectStore,
+    verify_conditional_writes,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -95,3 +103,34 @@ def test_delete_then_get_raises(store: S3ObjectStore) -> None:
     store.delete("tmp")
     with pytest.raises(ObjectNotFoundError):
         store.get("tmp")
+
+
+def test_verify_conditional_writes_passes_on_conformant_store(store: S3ObjectStore) -> None:
+    verify_conditional_writes(store)  # must not raise; leaves no residue
+    with pytest.raises(ObjectNotFoundError):
+        store.get("cas-probe")
+
+
+def test_verify_conditional_writes_rejects_ignoring_store() -> None:
+    """A store that accepts-but-ignores conditional headers (garage 1.3.1)
+
+    must be rejected loudly — it would corrupt a lake with zero errors.
+    """
+
+    class IgnoresConditionals(InMemoryObjectStore):
+        @override
+        def put_if_absent(self, key: str, body: bytes) -> str:
+            with self._lock:  # pyright: ignore[reportPrivateUsage]
+                etag = self._next_etag()  # pyright: ignore[reportPrivateUsage]
+                self._objects[key] = (body, etag)  # pyright: ignore[reportPrivateUsage]
+                return etag
+
+        @override
+        def put_if_match(self, key: str, body: bytes, etag: str) -> str:
+            with self._lock:  # pyright: ignore[reportPrivateUsage]
+                new_etag = self._next_etag()  # pyright: ignore[reportPrivateUsage]
+                self._objects[key] = (body, new_etag)  # pyright: ignore[reportPrivateUsage]
+                return new_etag
+
+    with pytest.raises(ExternalServiceError, match="does not enforce"):
+        verify_conditional_writes(IgnoresConditionals())

@@ -25,7 +25,11 @@ import pytest
 
 from ducklake_serverless.engine import S3Credentials
 from ducklake_serverless.gc import collect
-from ducklake_serverless.objectstore import S3ObjectStore, make_s3_client
+from ducklake_serverless.objectstore import (
+    S3ObjectStore,
+    make_s3_client,
+    verify_conditional_writes,
+)
 from ducklake_serverless.root import read_root
 from ducklake_serverless.session import Lake
 
@@ -72,6 +76,10 @@ def prefix() -> Iterator[str]:
     with contextlib.suppress(client.exceptions.BucketAlreadyOwnedByYou):
         client.create_bucket(Bucket=BUCKET)
     store = S3ObjectStore(client, BUCKET, prefix=run_prefix)
+    # The endpoint must ENFORCE conditional writes, not just accept the
+    # headers — garage 1.3.1 accepts-and-ignores them, which would make
+    # every test here pass while proving nothing.
+    verify_conditional_writes(store)
     yield run_prefix
     for key in store.list_prefix(""):
         store.delete(key)

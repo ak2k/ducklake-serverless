@@ -24,7 +24,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from ducklake_serverless.objectstore import S3ObjectStore, make_s3_client
+from ducklake_serverless.objectstore import (
+    S3ObjectStore,
+    make_s3_client,
+    verify_conditional_writes,
+)
 from ducklake_serverless.root import read_root
 from ducklake_serverless.session import Lake
 
@@ -47,6 +51,7 @@ def live_store() -> Iterator[S3ObjectStore]:
     client = make_s3_client(endpoint_url=ENDPOINT)
     prefix = f"ducklake-serverless-test/{uuid.uuid4()}"
     store = S3ObjectStore(client, str(BUCKET), prefix=prefix)
+    verify_conditional_writes(store)
     yield store
     for key in store.list_prefix(""):
         store.delete(key)

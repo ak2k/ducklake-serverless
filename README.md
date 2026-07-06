@@ -32,6 +32,12 @@ be Lambdas. The serialization point is the S3 conditional write itself —
 supported by AWS S3 (since 2024), GCS, Azure, R2, MinIO, and iDrive E2
 (verified empirically).
 
+**Verify your endpoint before trusting it**: some S3-compatible stores
+accept `If-Match`/`If-None-Match` headers without enforcing them (garage
+1.3.1 does — every conditional PUT "succeeds"), which would corrupt a lake
+with zero errors. `verify_conditional_writes(store)` probes this in one
+round-trip; the integration and live test lanes run it automatically.
+
 ## Concurrency semantics
 
 Same deal as Delta Lake and Iceberg's optimistic concurrency, applied to the

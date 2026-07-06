@@ -182,6 +182,40 @@ class S3ObjectStore:
             raise AmbiguousCasError(f"{key!r}: outcome unknown") from exc
 
 
+def verify_conditional_writes(store: ObjectStore, probe_key: str = "cas-probe") -> None:
+    """Prove the store ENFORCES conditional writes; raise if it doesn't.
+
+    Some S3-compatible stores (garage as of 1.3.1, older MinIO) silently
+    ACCEPT If-None-Match/If-Match headers without enforcing them — every
+    writer "wins" every CAS and the lake corrupts with zero errors. Run
+    this once against any new endpoint before trusting it with a lake.
+    Leaves no residue (probe object is deleted).
+    """
+    etag = store.put_if_absent(probe_key, b"probe-1")
+    try:
+        try:
+            store.put_if_absent(probe_key, b"probe-2")
+        except PreconditionFailedError:
+            pass
+        else:
+            raise ExternalServiceError(
+                "store does not enforce If-None-Match — conditional writes "
+                "are silently ignored; this store cannot host a lake"
+            )
+        store.put_if_match(probe_key, b"probe-3", etag)  # correct etag: must succeed
+        try:
+            store.put_if_match(probe_key, b"probe-4", etag)  # now stale: must 412
+        except PreconditionFailedError:
+            pass
+        else:
+            raise ExternalServiceError(
+                "store does not enforce If-Match — conditional writes are "
+                "silently ignored; this store cannot host a lake"
+            )
+    finally:
+        store.delete(probe_key)
+
+
 class InMemoryObjectStore:
     """Deterministic fake for unit and stateful property tests.
 
