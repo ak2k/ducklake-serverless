@@ -30,6 +30,8 @@ from ducklake_serverless.errors import (
     AmbiguousCasError,
     ConditionalConflictError,
     ConflictAbortError,
+    ExternalServiceError,
+    ObjectNotFoundError,
     PreconditionFailedError,
     VersionMismatchError,
 )
@@ -154,10 +156,7 @@ class Lake:
         the whole call raises ConflictAbortError. VersionMismatchError if
         local versions differ from the lake's pins.
         """
-        base, etag = read_root(self._store)
-        self._check_versions(base)
-
-        work = self._cache.fetch_copy(base.generation, base.catalog_uuid)
+        base, etag, work = self._fetch_current_base()
         connection = LakeConnection(work, self._data_path)
         transaction = Transaction(connection)
         try:
@@ -202,12 +201,21 @@ class Lake:
                     )
                 base, etag = current, current_etag
 
-            attempt += 1
-            decision = decide_rebase(changeset, self._conflict_policy, attempt, self._max_attempts)
-            if isinstance(decision, Abort):
-                raise ConflictAbortError(decision.reason)
-            _backoff(attempt)
-            work = self._replay(base, changeset)
+            while True:
+                attempt += 1
+                decision = decide_rebase(
+                    changeset, self._conflict_policy, attempt, self._max_attempts
+                )
+                if isinstance(decision, Abort):
+                    raise ConflictAbortError(decision.reason)
+                _backoff(attempt)
+                try:
+                    work = self._replay(base, changeset)
+                    break
+                except ObjectNotFoundError:
+                    # GC swept the base between our root read and the fetch —
+                    # the root has necessarily advanced; rebase onto current.
+                    base, etag = read_root(self._store)
 
     def _replay(self, winner: RootDoc, changeset: Changeset) -> Path:
         """Re-execute the changeset against a fresh copy of the winner's catalog."""
@@ -223,11 +231,30 @@ class Lake:
         connection.close()
         return work
 
+    def _fetch_current_base(self) -> tuple[RootDoc, str, Path]:
+        """Resolve the current root and fetch its catalog, GC-race-safe.
+
+        Between reading the root and fetching its catalog, GC may sweep
+        that generation (the root advanced past retention meanwhile). No
+        user SQL has run yet, so re-reading and retrying is always correct.
+        """
+        for _ in range(self._max_attempts):
+            base, etag = read_root(self._store)
+            self._check_versions(base)
+            try:
+                return base, etag, self._cache.fetch_copy(base.generation, base.catalog_uuid)
+            except ObjectNotFoundError:
+                continue
+        raise ExternalServiceError(
+            f"catalog for the current root kept vanishing across "
+            f"{self._max_attempts} attempts — GC retention is too aggressive "
+            "for this commit rate"
+        )
+
     @contextmanager
     def reader(self) -> Generator[LakeConnection]:
         """Attach the current generation READ_ONLY (frozen-DuckLake pattern)."""
-        doc, _ = read_root(self._store)
-        path = self._cache.fetch_copy(doc.generation, doc.catalog_uuid)
+        _, _, path = self._fetch_current_base()
         connection = LakeConnection(path, data_path=None, read_only=True)
         try:
             yield connection
