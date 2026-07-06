@@ -247,6 +247,10 @@ def test_writers_with_concurrent_data_maintenance(tmp_path: Path) -> None:
                     expire_older_than=now,
                     physical_delete_delay=now,
                     dry_run=False,
+                    # Zero delay races appenders' staged Parquet on purpose:
+                    # appends re-stage on replay, so the race is survivable
+                    # here; production keeps the floor.
+                    _unsafe_allow_short_delay=True,
                 )
                 if report is not None:
                     maintenance_runs.append(report)

@@ -336,14 +336,19 @@ class Lake:
 
     @contextmanager
     def scratch(self) -> Generator[LakeConnection]:
-        """Writable connection on a throwaway copy — NEVER published.
+        """Writable connection on a throwaway CATALOG copy — never published.
 
-        For inspection that needs write-capable attach semantics (e.g.
-        maintenance dry-runs, which READ_ONLY refuses) without any commit:
-        whatever happens to the copy is discarded on exit.
+        Only catalog mutations are discarded on exit. Statements that act on
+        DATA_PATH (inserts spilling Parquet, maintenance CALLs without
+        ``dry_run => true``) still hit the shared bucket immediately — run
+        exclusively dry-run/read statements here.
         """
         _, _, work = self._fetch_current_base()
-        connection = LakeConnection(work, self._data_path, s3_credentials=self._s3_credentials)
+        try:
+            connection = LakeConnection(work, self._data_path, s3_credentials=self._s3_credentials)
+        except BaseException:
+            GenerationCache.discard(work)
+            raise
         try:
             yield connection
         finally:
@@ -354,9 +359,13 @@ class Lake:
     def reader(self) -> Generator[LakeConnection]:
         """Attach the current generation READ_ONLY (frozen-DuckLake pattern)."""
         _, _, path = self._fetch_current_base()
-        connection = LakeConnection(
-            path, data_path=None, read_only=True, s3_credentials=self._s3_credentials
-        )
+        try:
+            connection = LakeConnection(
+                path, data_path=None, read_only=True, s3_credentials=self._s3_credentials
+            )
+        except BaseException:
+            GenerationCache.discard(path)
+            raise
         try:
             yield connection
         finally:

@@ -23,7 +23,12 @@ Protocol invariants agents must not weaken (see `docs/` and the plan):
   format is forbidden — BOTH pins are enforced: duckdb_storage_version before
   attach, ducklake_format_version before publish.
 - GC never deletes the current generation or any generation inside the
-  retention window; readers pinned to retained generations survive GC.
+  retention window; readers pinned to retained generations keep their
+  catalog ATTACH unconditionally. Their DATA reads are durable for
+  min(catalog retention window, expire_older_than + physical_delete_delay)
+  — plan expire_older_than around the longest reader pin.
+- Non-dry-run data maintenance enforces MIN_PHYSICAL_DELAY: the orphan pass
+  must never race an in-flight writer's staged-but-uncommitted Parquet.
 - S3 clients MUST disable transport retries (`make_s3_client`) — an SDK-level
   retry of a conditional PUT can 412 against our own successful write,
   masking a committed transaction as a lost race.

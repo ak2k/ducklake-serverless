@@ -1,20 +1,22 @@
 """Garbage collection: retention-ordered, lease-guarded, dry-run first.
 
-Order is the whole design. A generation older than the retention window
-may still be pinned by a reader, and Parquet referenced only by retained
-older generations looks orphaned to the current one — so:
+Two independent, separately-invocable passes share one fleet-wide lease
+(same LEASE_KEY — catalog GC and data maintenance are intentionally
+mutually exclusive; a co-scheduled run returns None and retries later):
 
-1. Sweep expired catalog/ objects FIRST (never the current generation,
-   never anything inside the retention window). This also collects
-   lost-CAS orphan catalogs.
-2. Only then run DuckLake's own snapshot expiry + orphan-file cleanup,
-   committed through the normal CAS path like any other transaction.
+- ``collect`` — sweeps expired catalog/ generation objects (never the
+  current generation, never anything inside the count-based retention
+  window). Also collects lost-CAS orphan catalogs.
+- ``maintain_data`` — DuckLake's own snapshot expiry + physical file
+  cleanup + orphan-Parquet deletion, committed through the normal CAS
+  path. Time-based gates; see its docstring for the three safety
+  arguments and how the two windows compose for reader pins.
 
-The lease makes concurrent GC runners a no-op rather than a hazard.
-Overlap safety does NOT come from CAS (delete is unconditional) — it
-comes from sweep monotonicity: swept keys are immutable garbage outside
-the retention window of a root that only moves forward, so deleting one
-twice, or from two runners, is idempotent and never touches live state.
+Overlap safety for ``collect`` does NOT come from CAS (delete is
+unconditional) — it comes from sweep monotonicity: swept keys are
+immutable garbage outside the retention window of a root that only moves
+forward, so deleting one twice, or from two runners, is idempotent and
+never touches live state.
 """
 
 from __future__ import annotations
@@ -40,9 +42,9 @@ DEFAULT_RETAIN_GENERATIONS = 10
 
 # Snapshots older than this are expired (time travel beyond it is given up).
 DEFAULT_EXPIRE_AGE = timedelta(days=7)
-# Physical deletion lags scheduling by this much. Must exceed the wall-clock
-# span of the catalog retention window plus the longest plausible commit —
-# see maintain_data's docstring for why this makes out-of-band deletes safe.
+# Physical deletion lags scheduling by this much. Protects in-flight writers
+# (staged-but-uncommitted Parquet is 'orphaned' until its commit lands) and
+# extends reader-pin durability — see maintain_data's safety notes.
 DEFAULT_PHYSICAL_DELAY = timedelta(days=1)
 
 
@@ -53,7 +55,6 @@ class GcReport:
     dry_run: bool
     swept_catalogs: list[str] = field(default_factory=list)
     kept_catalogs: list[str] = field(default_factory=list)
-    snapshots_expired: bool = False
 
 
 def collect(
@@ -146,8 +147,15 @@ def _collect_locked(
         dry_run=dry_run,
         swept_catalogs=sorted(swept),
         kept_catalogs=sorted(kept),
-        snapshots_expired=False,
     )
+
+
+# Floor for non-dry-run physical deletion. Below this, the age gate cannot
+# be trusted to outlast an in-flight writer's stage-Parquet-then-commit
+# window, and the orphan pass could delete a live transaction's staged
+# files (see maintain_data's safety notes). Tests use dry_run or accept
+# the risk explicitly via _unsafe_allow_short_delay.
+MIN_PHYSICAL_DELAY = timedelta(minutes=15)
 
 
 def maintain_data(
@@ -159,6 +167,7 @@ def maintain_data(
     physical_delete_delay: timedelta = DEFAULT_PHYSICAL_DELAY,
     dry_run: bool = True,
     lease_ttl_seconds: float = 300.0,
+    _unsafe_allow_short_delay: bool = False,
 ) -> MaintenanceReport | None:
     """Run one data-plane maintenance pass. None if another runner holds the lease.
 
@@ -175,24 +184,53 @@ def maintain_data(
     3. ``ducklake_delete_orphaned_files`` with the same age gate — deletes
        never-referenced Parquet (aborted/lost transactions).
 
-    Why the age gate is load-bearing: the physical deletes are side effects
-    OUTSIDE the CAS transaction. If this run's commit loses its race, files
-    it deleted must already have been dead in every retained generation and
-    invisible to every in-flight commit — which holds exactly when
-    ``physical_delete_delay`` exceeds the wall-clock span of the catalog
-    retention window plus the longest plausible commit. The upstream #815
-    mis-orphaning bug is fixed (ducklake PR #863) and our pins refuse older
-    extensions, but dry_run stays the default: inspect before deleting.
+    Safety notes (the physical deletes are side effects OUTSIDE the CAS
+    transaction — three distinct arguments cover the three hazards):
 
-    A lost CAS race aborts cleanly (maintenance CALLs are state-dependent —
-    never replayed); the next scheduled run simply retries.
+    - **Lost CAS race**: safe by schedule-table semantics, not by the age
+      gate. ``cleanup_old_files`` only deletes files whose *scheduling*
+      committed in an ancestor generation, so any writer that beats our
+      commit built on a catalog that already considered them dead.
+    - **In-flight writers**: a writer stages Parquet BEFORE its commit; those
+      files are never-referenced until the commit lands, so only the orphan
+      pass's age gate protects them. ``physical_delete_delay`` must exceed
+      the longest plausible stage-to-commit window — enforced by
+      ``MIN_PHYSICAL_DELAY`` in non-dry-run mode.
+    - **Pinned readers**: expiring a snapshot gives up data reads on catalog
+      generations that still reference it. The catalog ATTACH keeps working
+      (generation files are swept by count-based ``collect``), but Parquet
+      scans fail once cleanup reclaims the files. The real contract: a
+      reader pin is durable for ``min(catalog retention window,
+      expire_older_than + physical_delete_delay)`` — plan
+      ``expire_older_than`` around the longest reader pin, not around the
+      generation count.
+
+    The upstream #815 mis-orphaning bug is fixed (ducklake PR #863) and our
+    version pins refuse older extensions, but dry_run stays the default:
+    inspect before deleting. A lost CAS race aborts cleanly (maintenance
+    CALLs are state-dependent — never replayed); the next run retries. A
+    pass that would change nothing skips its commit entirely, so idle-lake
+    maintenance ticks do not churn generations.
     """
+    if expire_older_than < timedelta(0) or physical_delete_delay < timedelta(0):
+        raise InputValidationError(
+            "expire_older_than and physical_delete_delay must be non-negative "
+            "(a negative delay collapses the two-phase schedule/delete gate)"
+        )
+    if not dry_run and physical_delete_delay < MIN_PHYSICAL_DELAY and not _unsafe_allow_short_delay:
+        raise InputValidationError(
+            f"physical_delete_delay {physical_delete_delay} is below the "
+            f"{MIN_PHYSICAL_DELAY} floor — the orphan pass could delete an "
+            "in-flight writer's staged Parquet. Raise the delay (or, in "
+            "tests with no concurrent writers, pass _unsafe_allow_short_delay=True)."
+        )
     lease = Lease(store, holder_id, ttl_seconds=lease_ttl_seconds)
     if not lease.acquire():
         return None
     try:
         return _maintain_locked(
             lake,
+            lease,
             expire_older_than=expire_older_than,
             physical_delete_delay=physical_delete_delay,
             dry_run=dry_run,
@@ -203,6 +241,7 @@ def maintain_data(
 
 def _maintain_locked(
     lake: Lake,
+    lease: Lease,
     *,
     expire_older_than: timedelta,
     physical_delete_delay: timedelta,
@@ -212,29 +251,39 @@ def _maintain_locked(
     expire_before = now - expire_older_than
     physical_before = now - physical_delete_delay
 
-    if dry_run:
-        # The ducklake CALLs delete nothing under dry_run => true, and
-        # scratch() guarantees the connection's copy is never published.
-        with lake.scratch() as con:
-            expired = con.execute(
-                "CALL ducklake_expire_snapshots('lake', dry_run => true, older_than => ?)",
-                (expire_before,),
-            )
-            cleaned = con.execute(
-                "CALL ducklake_cleanup_old_files('lake', dry_run => true, older_than => ?)",
-                (physical_before,),
-            )
-            orphans = con.execute(
-                "CALL ducklake_delete_orphaned_files('lake', dry_run => true, older_than => ?)",
-                (physical_before,),
-            )
-        return MaintenanceReport(
-            dry_run=True,
-            snapshots_expired=_column(expired),
-            files_cleaned=_column(cleaned),
-            orphans_deleted=_column(orphans),
+    # Probe first (dry CALLs delete nothing; scratch()'s catalog copy is
+    # never published). Serves both modes: it IS the dry-run result, and in
+    # wet mode a nothing-to-do probe lets us skip the commit entirely — an
+    # idle lake's maintenance tick must not churn catalog generations.
+    with lake.scratch() as con:
+        expired = con.execute(
+            "CALL ducklake_expire_snapshots('lake', dry_run => true, older_than => ?)",
+            (expire_before,),
         )
+        cleaned = con.execute(
+            "CALL ducklake_cleanup_old_files('lake', dry_run => true, older_than => ?)",
+            (physical_before,),
+        )
+        orphans = con.execute(
+            "CALL ducklake_delete_orphaned_files('lake', dry_run => true, older_than => ?)",
+            (physical_before,),
+        )
+    probe = MaintenanceReport(
+        dry_run=True,
+        snapshots_expired=_column(expired),
+        files_cleaned=_column(cleaned),
+        orphans_deleted=_column(orphans),
+    )
+    if dry_run or not (probe.snapshots_expired or probe.files_cleaned or probe.orphans_deleted):
+        return probe
 
+    # The probe took real time on a large lake; prove we still hold the
+    # lease before the deleting pass, and again before publishing.
+    if not lease.renew():
+        raise ExternalServiceError(
+            "lost the maintenance lease after the probe — another runner "
+            "may be active; aborting before any physical deletion"
+        )
     with lake.transaction() as tx:
         expired = tx.sql(
             "CALL ducklake_expire_snapshots('lake', older_than => ?)", (expire_before,)
@@ -246,6 +295,17 @@ def _maintain_locked(
             "CALL ducklake_delete_orphaned_files('lake', older_than => ?)",
             (physical_before,),
         )
+        if not lease.renew():
+            # Deletes already happened (safe: schedule-table semantics for
+            # cleaned files, age gate for orphans) — but publishing a
+            # generation while another runner may also be publishing invites
+            # needless CAS churn. Abort; the catalog schedule state is
+            # unchanged, so the next holder's pass converges.
+            raise ExternalServiceError(
+                "lost the maintenance lease before commit — aborting the "
+                "catalog publish; physical deletes already done are safe "
+                "and the next pass converges"
+            )
     return MaintenanceReport(
         dry_run=False,
         snapshots_expired=_column(expired),

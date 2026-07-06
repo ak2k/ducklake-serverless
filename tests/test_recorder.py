@@ -109,3 +109,13 @@ def test_upserts_and_external_scans_are_state_dependent(sql: str) -> None:
 def test_volatile_aliases_rejected(sql: str) -> None:
     with pytest.raises(InputValidationError, match="volatile"):
         classify(sql)
+
+
+def test_maintenance_calls_never_classify_as_blind_append() -> None:
+    """Load-bearing for 'maintenance never replays': a lost CAS must abort."""
+    for sql in (
+        "CALL ducklake_expire_snapshots('lake', older_than => ?)",
+        "CALL ducklake_cleanup_old_files('lake', older_than => ?)",
+        "CALL ducklake_delete_orphaned_files('lake', older_than => ?)",
+    ):
+        assert classify(sql) is StatementClass.STATE_DEPENDENT_DML

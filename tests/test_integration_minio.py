@@ -223,15 +223,29 @@ def test_data_maintenance_over_real_store(prefix: str, tmp_path: Path) -> None:
     store = S3ObjectStore(_client(), BUCKET, prefix=prefix)
     now = timedelta(0)
     r1 = maintain_data(
-        lake, store, "it-gc", expire_older_than=now, physical_delete_delay=now, dry_run=False
+        lake,
+        store,
+        "it-gc",
+        expire_older_than=now,
+        physical_delete_delay=now,
+        dry_run=False,
+        _unsafe_allow_short_delay=True,  # no concurrent writers in this test
     )
     assert r1 is not None and r1.snapshots_expired
     r2 = maintain_data(
-        lake, store, "it-gc", expire_older_than=now, physical_delete_delay=now, dry_run=False
+        lake,
+        store,
+        "it-gc",
+        expire_older_than=now,
+        physical_delete_delay=now,
+        dry_run=False,
+        _unsafe_allow_short_delay=True,
     )
     assert r2 is not None and r2.files_cleaned
 
     assert bucket_parquets() < before  # dead Parquet reclaimed from the bucket
     verify = make_lake(prefix, tmp_path / "v")
     with verify.reader() as con:
-        assert con.execute("SELECT count(*) FROM t") == [(50000,)]  # live intact
+        # sum() forces real Parquet reads over httpfs — count(*) answers
+        # from catalog metadata and passes even when files are gone.
+        assert con.execute("SELECT count(*), sum(id) FROM t") == [(50000, 1249975000)]
