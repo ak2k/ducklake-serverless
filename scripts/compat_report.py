@@ -38,8 +38,10 @@ VERDICT_LABEL = {
 def main() -> int:
     """Render the table from a directory of probe JSON files."""
     results_dir = Path(sys.argv[1])
-    rows = [json.loads(p.read_text()) for p in sorted(results_dir.glob("*.json"))]
-    rows += MANUAL_ROWS
+    rows: list[dict[str, str]] = [
+        json.loads(p.read_text()) for p in sorted(results_dir.glob("*.json"))
+    ]  # pyright: ignore[reportAny]  # probe JSON is our own fixed schema
+    rows += MANUAL_ROWS  # pyright: ignore[reportArgumentType]
 
     lines = [
         "# S3 conditional-write compatibility",

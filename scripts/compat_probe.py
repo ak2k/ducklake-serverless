@@ -16,10 +16,14 @@ import json
 import sys
 import uuid
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import boto3
 import botocore.exceptions
 from botocore.config import Config
+
+if TYPE_CHECKING:
+    from mypy_boto3_s3.client import S3Client
 
 PROBE_BODY_1 = b'{"probe": 1}'
 PROBE_BODY_2 = b'{"probe": 2}'
@@ -30,24 +34,24 @@ def _status(exc: botocore.exceptions.ClientError) -> int:
     return int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
 
 
-def probe(client: object, bucket: str, key: str) -> dict[str, str]:
+def probe(client: S3Client, bucket: str, key: str) -> dict[str, str]:
     """Four-probe CAS conformance check. Returns per-probe outcomes."""
     results: dict[str, str] = {}
 
     def put(name: str, **kwargs: object) -> None:
         try:
-            client.put_object(Bucket=bucket, Key=key, **kwargs)  # pyright: ignore[reportAttributeAccessIssue]
+            client.put_object(Bucket=bucket, Key=key, **kwargs)  # pyright: ignore[reportArgumentType]  # kwargs shape varies by probe
             results[name] = "200"
         except botocore.exceptions.ClientError as exc:
             results[name] = str(_status(exc))
 
     put("create_only_fresh", Body=PROBE_BODY_1, IfNoneMatch="*")
     put("create_only_existing", Body=PROBE_BODY_1, IfNoneMatch="*")
-    head = client.head_object(Bucket=bucket, Key=key)  # pyright: ignore[reportAttributeAccessIssue]
+    head = client.head_object(Bucket=bucket, Key=key)
     etag = head["ETag"].strip('"')
     put("if_match_correct", Body=PROBE_BODY_2, IfMatch=etag)
     put("if_match_stale", Body=PROBE_BODY_2, IfMatch=etag)
-    client.delete_object(Bucket=bucket, Key=key)  # pyright: ignore[reportAttributeAccessIssue]
+    client.delete_object(Bucket=bucket, Key=key)
     return results
 
 
@@ -74,7 +78,7 @@ def run_moto() -> tuple[dict[str, str], str]:
 
     version = importlib.metadata.version("moto")
     with mock_aws():
-        client = boto3.client("s3", region_name="us-east-1")
+        client: S3Client = boto3.client("s3", region_name="us-east-1")  # pyright: ignore[reportUnknownMemberType]  # boto3 factory untyped
         client.create_bucket(Bucket="compat-probe")
         results = probe(client, "compat-probe", f"probe/{uuid.uuid4()}")
     return results, version
@@ -82,7 +86,7 @@ def run_moto() -> tuple[dict[str, str], str]:
 
 def run_endpoint(endpoint: str, access_key: str, secret_key: str, bucket: str) -> dict[str, str]:
     """Probe a live S3-compatible endpoint."""
-    client = boto3.client(
+    client: S3Client = boto3.client(  # pyright: ignore[reportUnknownMemberType]  # boto3 factory untyped
         "s3",
         endpoint_url=endpoint,
         region_name="us-east-1",
@@ -106,31 +110,42 @@ def main() -> int:
     parser.add_argument("--secret-key", default="probe")
     parser.add_argument("--bucket", default="compat-probe")
     parser.add_argument("--out", required=True, help="Output JSON path")
-    args = parser.parse_args()
+    # argparse Namespace attrs are Any; bind them once with real types here.
+    ns = parser.parse_args()
+    backend: str = ns.backend  # pyright: ignore[reportAny]
+    arg_version: str = ns.version  # pyright: ignore[reportAny]
+    expected: str = ns.expected  # pyright: ignore[reportAny]
+    endpoint: str | None = ns.endpoint  # pyright: ignore[reportAny]
+    access_key: str = ns.access_key  # pyright: ignore[reportAny]
+    secret_key: str = ns.secret_key  # pyright: ignore[reportAny]
+    bucket: str = ns.bucket  # pyright: ignore[reportAny]
+    out: str = ns.out  # pyright: ignore[reportAny]
 
-    if args.backend == "moto":
+    if backend == "moto":
         results, version = run_moto()
     else:
-        results = run_endpoint(args.endpoint, args.access_key, args.secret_key, args.bucket)
-        version = args.version
+        if endpoint is None:
+            parser.error("--endpoint is required for non-moto backends")
+        results = run_endpoint(endpoint, access_key, secret_key, bucket)
+        version = arg_version
 
     verdict = verdict_of(results)
     doc = {
-        "backend": args.backend,
+        "backend": backend,
         "version": version,
         "verdict": verdict,
-        "expected": args.expected,
+        "expected": expected,
         "probes": results,
         "tested_at": datetime.datetime.now(tz=datetime.UTC).strftime("%Y-%m-%d"),
         "provenance": "ci",
     }
-    Path(args.out).write_text(json.dumps(doc, indent=2) + "\n")
+    Path(out).write_text(json.dumps(doc, indent=2) + "\n")
     print(json.dumps(doc, indent=2))
 
-    if verdict != args.expected:
+    if verdict != expected:
         print(
-            f"\nVERDICT CHANGED: {args.backend} {version} — expected "
-            f"'{args.expected}', observed '{verdict}'. If this is a Renovate "
+            f"\nVERDICT CHANGED: {backend} {version} — expected "
+            f"'{expected}', observed '{verdict}'. If this is a Renovate "
             "bump, the new version changed conditional-write behavior: update "
             "the expected verdict AND docs/compatibility.md.",
             file=sys.stderr,

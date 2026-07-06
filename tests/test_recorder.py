@@ -73,7 +73,7 @@ def test_multi_statement_rejected() -> None:
         classify("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)")
 
 
-def test_unparseable_rejected() -> None:
+def test_unparsable_rejected() -> None:
     with pytest.raises(InputValidationError, match="parse"):
         classify("THIS IS NOT SQL AT (((")
 

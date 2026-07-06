@@ -205,7 +205,7 @@ def maintain_data(
       ``expire_older_than`` around the longest reader pin, not around the
       generation count.
 
-    The upstream #815 mis-orphaning bug is fixed (ducklake PR #863) and our
+    The upstream #815 misorphaning bug is fixed (ducklake PR #863) and our
     version pins refuse older extensions, but dry_run stays the default:
     inspect before deleting. A lost CAS race aborts cleanly (maintenance
     CALLs are state-dependent — never replayed); the next run retries. A

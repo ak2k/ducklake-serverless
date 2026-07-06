@@ -12,19 +12,19 @@ rename: ## rename package ducklake_serverless -> NEW (usage: make rename NEW=you
 check: lint typecheck test ## full inner loop (CI runs this)
 
 fix: ## autofix lint + format, then run full check
-	uv run ruff check --fix src tests
-	uv run ruff format src tests
+	uv run ruff check --fix src tests scripts
+	uv run ruff format src tests scripts
 	$(MAKE) check
 
 lint: ## ruff check (no fix) + format --check
-	uv run ruff check src tests
-	uv run ruff format --check src tests
+	uv run ruff check src tests scripts
+	uv run ruff format --check src tests scripts
 
 format: ## ruff format (writes)
-	uv run ruff format src tests
+	uv run ruff format src tests scripts
 
 typecheck: ## basedpyright strict
-	uv run basedpyright src tests
+	uv run basedpyright src tests scripts
 
 test: ## pytest
 	uv run pytest

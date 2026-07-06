@@ -194,7 +194,7 @@ def test_data_maintenance_over_real_store(prefix: str, tmp_path: Path) -> None:
     """The #815 class of bug: maintenance must reclaim dead Parquet over a
 
     real S3 API without ever touching live data. (Upstream fixed the
-    mis-orphaning in ducklake PR #863; this guards the whole path.)
+    misorphaning in ducklake PR #863; this guards the whole path.)
     """
     lake = make_lake(prefix, tmp_path / "w")
     lake.bootstrap()

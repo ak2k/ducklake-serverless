@@ -180,6 +180,14 @@
             nixfmt --check ${./flake.nix}
             touch $out
           '';
+          actionlint = pkgs.runCommand "check-actionlint" { nativeBuildInputs = [ pkgs.actionlint ]; } ''
+            actionlint ${./.github/workflows}/*.yml
+            touch $out
+          '';
+          typos = pkgs.runCommand "check-typos" { nativeBuildInputs = [ pkgs.typos ]; } ''
+            typos ${./src} ${./tests} ${./scripts} ${./README.md} ${./AGENTS.md}
+            touch $out
+          '';
         }
       );
     };

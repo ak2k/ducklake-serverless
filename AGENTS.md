@@ -205,7 +205,7 @@ Batch/sync transforms over a data engine — not a service. Tune as a set:
   `if TYPE_CHECKING: from structlog.stdlib import BoundLogger`, then suppress
   the RHS with `# pyright: ignore[reportAny]` + reason.
 - Use `http.HTTPStatus.NOT_FOUND` — stdlib, well-typed. Not `httpx.codes.NOT_FOUND`
-  (mis-typed by httpx as tuple) and not bare `404` (PLR2004).
+  (mistyped by httpx as tuple) and not bare `404` (PLR2004).
 - `extra="forbid"` Pydantic models raise on any unknown upstream field.
   Intentional: drift fails at the boundary, not silently corrupting downstream.
 - **Untyped data engines** (`duckdb`, `pandas`, `sqlglot`) flood `strict` mode with

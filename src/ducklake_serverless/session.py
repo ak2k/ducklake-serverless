@@ -119,7 +119,7 @@ class Lake:
 
         `data_path` is where DuckDB writes Parquet — an s3:// URL in
         production, a local directory in hermetic tests. No trailing slash
-        (upstream ducklake#815 mis-classifies files under one as orphans).
+        (upstream ducklake#815 misclassifies files under one as orphans).
         """
         self._store = store
         self._workdir = workdir
