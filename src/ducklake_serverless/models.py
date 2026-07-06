@@ -179,3 +179,14 @@ class CommitResult(BaseModel):
     generation: int
     catalog_uuid: UUID
     attempts: int
+
+
+class MaintenanceReport(BaseModel):
+    """What a data-plane maintenance pass did (or would do, under dry_run)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    dry_run: bool
+    snapshots_expired: tuple[str, ...] = ()
+    files_cleaned: tuple[str, ...] = ()
+    orphans_deleted: tuple[str, ...] = ()

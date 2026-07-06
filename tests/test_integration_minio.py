@@ -19,12 +19,13 @@ import concurrent.futures
 import contextlib
 import os
 import uuid
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 
 from ducklake_serverless.engine import S3Credentials
-from ducklake_serverless.gc import collect
+from ducklake_serverless.gc import collect, maintain_data
 from ducklake_serverless.objectstore import (
     S3ObjectStore,
     make_s3_client,
@@ -186,3 +187,51 @@ def test_gc_against_real_store(prefix: str, tmp_path: Path) -> None:
     reader_lake = make_lake(prefix, tmp_path / "r")
     with reader_lake.reader() as con:
         assert len(con.execute("SELECT v FROM t")) == 5
+
+
+@requires_minio
+def test_data_maintenance_over_real_store(prefix: str, tmp_path: Path) -> None:
+    """The #815 class of bug: maintenance must reclaim dead Parquet over a
+
+    real S3 API without ever touching live data. (Upstream fixed the
+    mis-orphaning in ducklake PR #863; this guards the whole path.)
+    """
+    lake = make_lake(prefix, tmp_path / "w")
+    lake.bootstrap()
+    with lake.transaction() as tx:
+        tx.sql("CREATE TABLE t (id INTEGER)")
+    with lake.transaction() as tx:
+        tx.sql("INSERT INTO t SELECT range FROM range(100000)")
+    with lake.transaction() as tx:
+        tx.sql("DELETE FROM t")
+    with lake.transaction() as tx:
+        tx.sql("INSERT INTO t SELECT range FROM range(50000)")
+
+    raw = _client()
+
+    def bucket_parquets() -> int:
+        listed = raw.list_objects_v2(Bucket=BUCKET, Prefix=f"{prefix}/data")
+        return sum(
+            1
+            for o in listed.get("Contents", [])
+            if (k := o.get("Key")) is not None and k.endswith(".parquet")
+        )
+
+    before = bucket_parquets()
+    assert before >= 2  # dead file + live file at minimum
+
+    store = S3ObjectStore(_client(), BUCKET, prefix=prefix)
+    now = timedelta(0)
+    r1 = maintain_data(
+        lake, store, "it-gc", expire_older_than=now, physical_delete_delay=now, dry_run=False
+    )
+    assert r1 is not None and r1.snapshots_expired
+    r2 = maintain_data(
+        lake, store, "it-gc", expire_older_than=now, physical_delete_delay=now, dry_run=False
+    )
+    assert r2 is not None and r2.files_cleaned
+
+    assert bucket_parquets() < before  # dead Parquet reclaimed from the bucket
+    verify = make_lake(prefix, tmp_path / "v")
+    with verify.reader() as con:
+        assert con.execute("SELECT count(*) FROM t") == [(50000,)]  # live intact

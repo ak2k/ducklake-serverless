@@ -22,6 +22,7 @@ dependencies = [
     "structlog>=24",
     "boto3>=1.36",
     "duckdb>=1.3",
+    "pytz>=2024.1",  # duckdb requires it to fetch TIMESTAMPTZ result columns (maintenance CALLs)
     "sqlglot>=25",
 ]
 

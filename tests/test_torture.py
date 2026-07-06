@@ -16,12 +16,13 @@ Invariants asserted at the end:
 from __future__ import annotations
 
 import threading
+from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 
 from ducklake_serverless.errors import ConflictAbortError
-from ducklake_serverless.gc import collect
+from ducklake_serverless.gc import collect, maintain_data
 from ducklake_serverless.models import parse_catalog_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
 from ducklake_serverless.root import read_root
@@ -201,3 +202,72 @@ def test_writers_with_concurrent_gc_hold_invariants(tmp_path: Path) -> None:
     final, _ = read_root(store)
     kept = [parse_catalog_key(k)[0] for k in store.list_prefix("catalog/")]
     assert final.generation in kept
+
+
+@pytest.mark.slow
+def test_writers_with_concurrent_data_maintenance(tmp_path: Path) -> None:
+    """Appenders race live data-plane maintenance: every ack survives.
+
+    The maintenance tick is deliberately spaced (not a hot loop): with zero
+    age gates every writer commit creates expirable history, so a 50ms tick
+    commits continuously and starves the appenders into attempt exhaustion —
+    a contention profile no real deployment has (production gates are days,
+    ticks are hours).
+    """
+    store = InMemoryObjectStore()
+    data = tmp_path / "data"
+    data.mkdir()
+    setup = make_lake(store, tmp_path, "msetup", data)
+    setup.bootstrap()
+    with setup.transaction() as tx:
+        tx.sql("CREATE TABLE markers (writer INTEGER, seq INTEGER)")
+
+    acks: list[tuple[int, int]] = []
+    lock = threading.Lock()
+    stop = threading.Event()
+    maintenance_runs: list[object] = []
+
+    def writer(writer_id: int) -> None:
+        lake = make_lake(store, tmp_path, f"mw{writer_id}", data)
+        for seq in range(12):
+            with lake.transaction() as tx:
+                tx.sql("INSERT INTO markers VALUES (?, ?)", (writer_id, seq))
+            with lock:
+                acks.append((writer_id, seq))
+
+    def maintenance_loop() -> None:
+        lake = make_lake(store, tmp_path, "mgc", data)
+        now = timedelta(0)
+        while not stop.is_set():
+            try:
+                report = maintain_data(
+                    lake,
+                    store,
+                    "torture-maintenance",
+                    expire_older_than=now,
+                    physical_delete_delay=now,
+                    dry_run=False,
+                )
+                if report is not None:
+                    maintenance_runs.append(report)
+            except ConflictAbortError:
+                pass  # lost a race to an appender — fine, retry next tick
+            stop.wait(0.5)
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(3)]
+    gc_thread = threading.Thread(target=maintenance_loop)
+    gc_thread.start()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    stop.set()
+    gc_thread.join()
+
+    assert maintenance_runs, "maintenance never completed a pass"
+    assert len(acks) == 3 * 12
+
+    verify = make_lake(store, tmp_path, "mverify", data)
+    with verify.reader() as con:
+        rows = con.execute("SELECT writer, seq FROM markers")
+        assert sorted(rows) == sorted(acks)  # exactly once, nothing lost

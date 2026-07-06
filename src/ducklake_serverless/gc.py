@@ -20,17 +20,30 @@ twice, or from two runners, is idempotent and never touches live state.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from ducklake_serverless.errors import ExternalServiceError, InputValidationError
 from ducklake_serverless.lease import Lease
-from ducklake_serverless.models import CATALOG_PREFIX, parse_catalog_key
+from ducklake_serverless.models import (
+    CATALOG_PREFIX,
+    MaintenanceReport,
+    parse_catalog_key,
+)
 from ducklake_serverless.root import read_root
 
 if TYPE_CHECKING:
     from ducklake_serverless.objectstore import ObjectStore
+    from ducklake_serverless.session import Lake
 
 DEFAULT_RETAIN_GENERATIONS = 10
+
+# Snapshots older than this are expired (time travel beyond it is given up).
+DEFAULT_EXPIRE_AGE = timedelta(days=7)
+# Physical deletion lags scheduling by this much. Must exceed the wall-clock
+# span of the catalog retention window plus the longest plausible commit —
+# see maintain_data's docstring for why this makes out-of-band deletes safe.
+DEFAULT_PHYSICAL_DELAY = timedelta(days=1)
 
 
 @dataclass(frozen=True)
@@ -129,14 +142,117 @@ def _collect_locked(
                     "swept keys are immutable garbage)"
                 )
 
-    # Snapshot expiry + orphan-Parquet cleanup (ducklake_expire_snapshots /
-    # ducklake_delete_orphaned_files) is deferred to the integration lane:
-    # its DATA_PATH semantics must be verified against a real store first
-    # (upstream ducklake#815 is a live data-loss bug in orphan detection).
-    # Generation sweeping alone already bounds catalog-storage growth.
     return GcReport(
         dry_run=dry_run,
         swept_catalogs=sorted(swept),
         kept_catalogs=sorted(kept),
         snapshots_expired=False,
     )
+
+
+def maintain_data(
+    lake: Lake,
+    store: ObjectStore,
+    holder_id: str,
+    *,
+    expire_older_than: timedelta = DEFAULT_EXPIRE_AGE,
+    physical_delete_delay: timedelta = DEFAULT_PHYSICAL_DELAY,
+    dry_run: bool = True,
+    lease_ttl_seconds: float = 300.0,
+) -> MaintenanceReport | None:
+    """Run one data-plane maintenance pass. None if another runner holds the lease.
+
+    One transaction, three DuckLake maintenance calls, committed through the
+    normal CAS path:
+
+    1. ``ducklake_expire_snapshots(older_than => now - expire_older_than)`` —
+       catalog-only: marks old snapshots unreachable and SCHEDULES their
+       exclusive files (timestamped). Deletes nothing.
+    2. ``ducklake_cleanup_old_files(older_than => now - physical_delete_delay)``
+       — physically deletes files scheduled at least ``physical_delete_delay``
+       ago. Files scheduled by step 1 of THIS run are too fresh to qualify;
+       a later run reclaims them.
+    3. ``ducklake_delete_orphaned_files`` with the same age gate — deletes
+       never-referenced Parquet (aborted/lost transactions).
+
+    Why the age gate is load-bearing: the physical deletes are side effects
+    OUTSIDE the CAS transaction. If this run's commit loses its race, files
+    it deleted must already have been dead in every retained generation and
+    invisible to every in-flight commit — which holds exactly when
+    ``physical_delete_delay`` exceeds the wall-clock span of the catalog
+    retention window plus the longest plausible commit. The upstream #815
+    mis-orphaning bug is fixed (ducklake PR #863) and our pins refuse older
+    extensions, but dry_run stays the default: inspect before deleting.
+
+    A lost CAS race aborts cleanly (maintenance CALLs are state-dependent —
+    never replayed); the next scheduled run simply retries.
+    """
+    lease = Lease(store, holder_id, ttl_seconds=lease_ttl_seconds)
+    if not lease.acquire():
+        return None
+    try:
+        return _maintain_locked(
+            lake,
+            expire_older_than=expire_older_than,
+            physical_delete_delay=physical_delete_delay,
+            dry_run=dry_run,
+        )
+    finally:
+        lease.release()
+
+
+def _maintain_locked(
+    lake: Lake,
+    *,
+    expire_older_than: timedelta,
+    physical_delete_delay: timedelta,
+    dry_run: bool,
+) -> MaintenanceReport:
+    now = datetime.now(tz=UTC)
+    expire_before = now - expire_older_than
+    physical_before = now - physical_delete_delay
+
+    if dry_run:
+        # The ducklake CALLs delete nothing under dry_run => true, and
+        # scratch() guarantees the connection's copy is never published.
+        with lake.scratch() as con:
+            expired = con.execute(
+                "CALL ducklake_expire_snapshots('lake', dry_run => true, older_than => ?)",
+                (expire_before,),
+            )
+            cleaned = con.execute(
+                "CALL ducklake_cleanup_old_files('lake', dry_run => true, older_than => ?)",
+                (physical_before,),
+            )
+            orphans = con.execute(
+                "CALL ducklake_delete_orphaned_files('lake', dry_run => true, older_than => ?)",
+                (physical_before,),
+            )
+        return MaintenanceReport(
+            dry_run=True,
+            snapshots_expired=_column(expired),
+            files_cleaned=_column(cleaned),
+            orphans_deleted=_column(orphans),
+        )
+
+    with lake.transaction() as tx:
+        expired = tx.sql(
+            "CALL ducklake_expire_snapshots('lake', older_than => ?)", (expire_before,)
+        )
+        cleaned = tx.sql(
+            "CALL ducklake_cleanup_old_files('lake', older_than => ?)", (physical_before,)
+        )
+        orphans = tx.sql(
+            "CALL ducklake_delete_orphaned_files('lake', older_than => ?)",
+            (physical_before,),
+        )
+    return MaintenanceReport(
+        dry_run=False,
+        snapshots_expired=_column(expired),
+        files_cleaned=_column(cleaned),
+        orphans_deleted=_column(orphans),
+    )
+
+
+def _column(rows: list[tuple[object, ...]]) -> tuple[str, ...]:
+    return tuple(str(r[0]) for r in rows)

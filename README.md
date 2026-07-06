@@ -3,11 +3,12 @@
 **Multi-writer [DuckLake](https://ducklake.select/) with no catalog server — the
 entire lakehouse, catalog included, lives in one object-storage bucket.**
 
-> Status: early development. The commit protocol, transaction envelope,
-> rebase-on-conflict, and lease-guarded GC are implemented and tested
-> (including live against iDrive E2); DuckLake snapshot expiry / orphan
-> Parquet cleanup and the MinIO integration lane are still pending. Not
-> affiliated with DuckDB Labs or the DuckLake project.
+> Status: early development, functionally complete. Commit protocol,
+> transaction envelope, rebase-on-conflict, catalog GC, and data-plane
+> maintenance (snapshot expiry + orphan-Parquet cleanup) are implemented
+> and tested — hermetically, against MinIO and SeaweedFS in CI, and live
+> against iDrive E2. Not affiliated with DuckDB Labs or the DuckLake
+> project.
 
 ## The idea
 

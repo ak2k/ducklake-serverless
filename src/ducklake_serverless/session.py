@@ -335,6 +335,22 @@ class Lake:
         )
 
     @contextmanager
+    def scratch(self) -> Generator[LakeConnection]:
+        """Writable connection on a throwaway copy — NEVER published.
+
+        For inspection that needs write-capable attach semantics (e.g.
+        maintenance dry-runs, which READ_ONLY refuses) without any commit:
+        whatever happens to the copy is discarded on exit.
+        """
+        _, _, work = self._fetch_current_base()
+        connection = LakeConnection(work, self._data_path, s3_credentials=self._s3_credentials)
+        try:
+            yield connection
+        finally:
+            connection.abandon()
+            GenerationCache.discard(work)
+
+    @contextmanager
     def reader(self) -> Generator[LakeConnection]:
         """Attach the current generation READ_ONLY (frozen-DuckLake pattern)."""
         _, _, path = self._fetch_current_base()
