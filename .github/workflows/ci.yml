@@ -65,21 +65,23 @@ jobs:
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      minio:
-        image: bitnami/minio:latest
-        env:
-          MINIO_ROOT_USER: minioadmin
-          MINIO_ROOT_PASSWORD: minioadmin
-        ports:
-          - 9000:9000
-        options: >-
-          --health-cmd "mc ready local || curl -sf http://localhost:9000/minio/health/ready"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
     steps:
       - uses: actions/checkout@v4
+
+      # The official minio image needs a command argument, which GH service
+      # containers cannot pass — run it directly instead.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready && exit 0
+            sleep 2
+          done
+          echo "minio never became ready" >&2
+          docker logs minio >&2
+          exit 1
 
       - name: Install uv
         uses: astral-sh/setup-uv@v3
