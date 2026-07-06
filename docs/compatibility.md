@@ -11,6 +11,11 @@ do not edit by hand.
 
 | Backend | Version | Conditional writes | Last verified | Provenance |
 |---|---|---|---|---|
+| MinIO | `RELEASE.2025-09-07T16-13-09Z` | ✅ enforces | 2026-07-06 | ci |
+| SeaweedFS | `4.38` | ✅ enforces | 2026-07-06 | ci |
+| moto | `5.2.2` | ✅ enforces | 2026-07-06 | ci |
+| garage | `v2.3.0` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-06 | ci |
+| rclone serve s3 | `1.74.3` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-06 | ci |
 | AWS S3 | `(service)` | ✅ enforces | 2024-11-25 | AWS launch announcement + delta-rs production use |
 | iDrive E2 | `(service)` | ✅ enforces | 2026-07-05 | manual probe (undocumented by iDrive; verified empirically) |
 
