@@ -70,21 +70,25 @@ jobs:
             "rclone/rclone:${RCLONE_VERSION}" \
             serve s3 /data --addr :9003 --auth-key probe,probeprobe
 
-          # garage needs config + layout + bucket + key setup
-          cat > /tmp/garage.toml <<'EOF'
+          # garage needs config + layout + bucket + key setup. Its tokens are
+          # generated per-run so nothing credential-shaped lives in the repo
+          # (the instance is ephemeral and unreachable from outside the job).
+          RPC_SECRET=$(openssl rand -hex 32)
+          ADMIN_TOKEN=$(openssl rand -hex 16)
+          cat > /tmp/garage.toml <<EOF
           metadata_dir = "/var/lib/garage/meta"
           data_dir = "/var/lib/garage/data"
           db_engine = "sqlite"
           replication_factor = 1
           rpc_bind_addr = "0.0.0.0:3901"
           rpc_public_addr = "127.0.0.1:3901"
-          rpc_secret = "1799bccfd7411eddcf9ebd316bc1f5287ad12a68094e1c6ac6abde7e6feae1ec"
+          rpc_secret = "$RPC_SECRET"
           [s3_api]
           s3_region = "garage"
           api_bind_addr = "0.0.0.0:3900"
           [admin]
           api_bind_addr = "0.0.0.0:3903"
-          admin_token = "probe-admin-token"
+          admin_token = "$ADMIN_TOKEN"
           EOF
           docker run -d --name garage -p 9004:3900 \
             -v /tmp/garage.toml:/etc/garage.toml \

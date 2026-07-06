@@ -1,0 +1,7 @@
+# Repo-local gitleaks config: extends the default ruleset.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Historical false positive: a throwaway rpc_secret for the ephemeral CI-only garage container (commit a169f25). Removed in the next commit — tokens are now generated per-run — but full-history scans still see it."
+commits = ["a169f25e1d99b6fa690b2c3a89e2cabdd131c222"]

@@ -30,4 +30,4 @@ jobs:
             | tar -xz -C /usr/local/bin gitleaks
 
       - name: Scan
-        run: gitleaks detect --source . --redact --no-banner -v
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --no-banner -v
