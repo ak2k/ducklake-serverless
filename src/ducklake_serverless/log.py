@@ -17,7 +17,7 @@ import structlog
 if TYPE_CHECKING:
     from structlog.typing import Processor
 
-    from myproject.config import LogLevel
+    from ducklake_serverless.config import LogLevel
 
 LEVELS: dict[str, int] = {
     "debug": logging.DEBUG,

@@ -2,6 +2,26 @@
 
 Contract for agents working in this repo. Read first; overrides defaults.
 
+## Project divergences from the template (declared, not drift)
+
+| Divergence | Rationale |
+|---|---|
+| `boto3` for S3, not `httpx` | Hand-rolling SigV4 + conditional-write headers over httpx recreates the exact bug class this library exists to prevent. `objectstore.py` is the ONLY module importing boto3; its `ClientError`s are wrapped into `errors.py` domain errors at that boundary. |
+| `duckdb` behind a typed facade | duckdb's Python API is loosely typed; basedpyright suppressions live only in `engine.py` (same treatment the template gives structlog). No other module imports duckdb. |
+| Sync core, no `anyio` | The commit path is inherently sequential (fetch → attach → SQL → detach → upload → CAS) and duckdb's API is sync. Parallelism in this system lives BETWEEN processes, arbitrated by S3 CAS — not inside one. An anyio wrapper may come later for consumers; the protocol core stays sync. |
+
+Protocol invariants agents must not weaken (see `docs/` and the plan):
+
+- The root object is the ONLY mutable key. Catalog generations and data files
+  are immutable, uniquely named, uploaded with `If-None-Match: *`.
+- Never retry a conditional PUT on an ambiguous outcome — resolve by re-reading
+  the root and comparing catalog UUIDs (`root.resolve_cas`).
+- `catalog_key` is derived from `(generation, uuid)`, never stored.
+- Only blind appends auto-replay on conflict; state-dependent DML aborts unless
+  the caller opted into `replay_all`.
+- Version fields in the root doc gate commits; auto-migration of the catalog
+  format is forbidden.
+
 ## Stack (one per concern; substitutes are bans)
 
 | Concern | Use | Not |
@@ -15,7 +35,7 @@ Contract for agents working in this repo. Read first; overrides defaults.
 | Logging | `structlog` | stdlib logging, `print()` |
 | Paths | `pathlib.Path` | `os.path` |
 | Tests | `pytest` + `hypothesis` | unittest |
-| Errors | subclass `myproject.errors.AppError` | bare `Exception`, string errors |
+| Errors | subclass `ducklake_serverless.errors.AppError` | bare `Exception`, string errors |
 
 The **`Not` column bans these for boundary validation**, not everywhere. Internally,
 a frozen `@dataclass(frozen=True)` is the right tool for a trusted value type that
@@ -67,11 +87,11 @@ failures, not noise. Nix users: `nix develop` first; everything else is identica
 
 3. **Copy the canonical example.** Inventing a new shape for any of these
    is a deliberate choice. The defaults are:
-   - service: `src/myproject/example_service.py`
-   - config:  `src/myproject/config.py`
-   - logging: `src/myproject/log.py`
+   - service: `src/ducklake_serverless/example_service.py`
+   - config:  `src/ducklake_serverless/config.py`
+   - logging: `src/ducklake_serverless/log.py`
    - test:    `tests/test_example_service.py`
-   - error:   `src/myproject/errors.py`
+   - error:   `src/ducklake_serverless/errors.py`
 
 4. **Diverge with a comment.** When tuning a default below (or deviating
    from the stack table), leave `# DIVERGE: <reason>` so future readers

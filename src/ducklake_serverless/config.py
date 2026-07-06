@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     """Application settings sourced from environment + `.env` file."""
 
     model_config = SettingsConfigDict(
-        env_prefix="MYPROJECT_",
+        env_prefix="DUCKLAKE_SERVERLESS_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="forbid",

@@ -1,7 +1,7 @@
 [project]
-name = "myproject"
+name = "ducklake_serverless"
 version = "0.1.0"
-description = "A new Python project."
+description = "Serverless multi-writer DuckLake: catalog-as-versioned-object with S3 conditional-write commits."
 readme = "README.md"
 license = { file = "LICENSE" }
 # 3.12 floor for broad host portability — every downstream adopter lowered the 3.13
@@ -17,11 +17,13 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "httpx>=0.27",
     "pydantic>=2.7",
     "pydantic-settings>=2.7",
     "structlog>=24",
-    "anyio>=4",
+    "boto3>=1.36",
+    "duckdb>=1.3",
+    "sqlglot>=25",
+    "stamina>=24",
 ]
 
 [dependency-groups]
@@ -31,6 +33,9 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=5",
     "hypothesis>=6.100",
+    "moto[s3]>=5.1.5",
+    "boto3-stubs[s3]>=1.35",
+    "mypy-boto3-s3>=1.43.31",
 ]
 
 [build-system]
@@ -38,7 +43,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/myproject"]
+packages = ["src/ducklake_serverless"]
 
 # --- ruff: lint + format ---
 [tool.ruff]

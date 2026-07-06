@@ -6,7 +6,7 @@ help: ## show this help
 install: ## uv sync (install all deps including dev)
 	uv sync
 
-rename: ## rename package myproject -> NEW (usage: make rename NEW=your_pkg_name)
+rename: ## rename package ducklake_serverless -> NEW (usage: make rename NEW=your_pkg_name)
 	uv run scripts/rename.py "$(NEW)"
 
 check: lint typecheck test ## full inner loop (CI runs this)

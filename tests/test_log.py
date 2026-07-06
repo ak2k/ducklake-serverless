@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from myproject.log import configure
+from ducklake_serverless.log import configure
 
 if TYPE_CHECKING:
-    from myproject.config import LogLevel
+    from ducklake_serverless.config import LogLevel
 
 
 def test_configure_runs_without_error() -> None:

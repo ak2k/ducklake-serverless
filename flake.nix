@@ -92,13 +92,13 @@
             lib.composeManyExtensions [
               editableOverlay
               (final: prev: {
-                myproject = prev.myproject.overrideAttrs (old: {
+                ducklake_serverless = prev.ducklake_serverless.overrideAttrs (old: {
                   nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ final.resolveBuildSystem { editables = [ ]; };
                 });
               })
             ]
           );
-          editableVenv = editablePythonSet.mkVirtualEnv "myproject-dev-env" workspace.deps.all;
+          editableVenv = editablePythonSet.mkVirtualEnv "ducklake_serverless-dev-env" workspace.deps.all;
         in
         {
           # Default shell: uv-managed. Matches the inner loop (`make fix`/`check`)
@@ -122,7 +122,7 @@
           };
 
           # Pure shell: uv2nix-built venv with the project installed editable.
-          # No `.venv` needed. Source edits to src/myproject/ are live. Bumping
+          # No `.venv` needed. Source edits to src/ducklake_serverless/ are live. Bumping
           # uv.lock requires exiting and re-entering so Nix re-resolves.
           # `uv lock --upgrade` works inside; `uv sync` is suppressed by UV_NO_SYNC.
           pure = pkgs.mkShell {
@@ -151,8 +151,8 @@
       # (basedpyright, ruff, pytest, ...). Both are Nix-built — no uv at
       # build time — suitable for nixpkgs PRs / NixOS modules / consumers.
       packages = forAllSystems (system: {
-        default = pythonSets.${system}.mkVirtualEnv "myproject-env" workspace.deps.default;
-        dev = pythonSets.${system}.mkVirtualEnv "myproject-dev-env" workspace.deps.all;
+        default = pythonSets.${system}.mkVirtualEnv "ducklake_serverless-env" workspace.deps.default;
+        dev = pythonSets.${system}.mkVirtualEnv "ducklake_serverless-dev-env" workspace.deps.all;
       });
 
       # `nix fmt` autoformats flake.nix to RFC-166 style.
