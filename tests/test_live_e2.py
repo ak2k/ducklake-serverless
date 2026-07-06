@@ -22,16 +22,16 @@ import threading
 import uuid
 from typing import TYPE_CHECKING
 
+import boto3
 import pytest
 
+from ducklake_serverless.objectstore import S3ObjectStore
 from ducklake_serverless.root import read_root
 from ducklake_serverless.session import Lake
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
-
-    from ducklake_serverless.objectstore import S3ObjectStore
 
 pytestmark = pytest.mark.live
 
@@ -45,10 +45,6 @@ requires_live = pytest.mark.skipif(
 
 @pytest.fixture
 def live_store() -> Iterator[S3ObjectStore]:
-    import boto3
-
-    from ducklake_serverless.objectstore import S3ObjectStore
-
     client = boto3.client("s3", endpoint_url=ENDPOINT)  # pyright: ignore[reportUnknownMemberType]
     prefix = f"ducklake-serverless-test/{uuid.uuid4()}"
     store = S3ObjectStore(client, str(BUCKET), prefix=prefix)
