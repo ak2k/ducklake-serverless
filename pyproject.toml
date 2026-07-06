@@ -119,7 +119,7 @@ filterwarnings = [
 ]
 markers = [
     # Pre-declare custom markers here; `--strict-markers` rejects undeclared ones.
-    # "slow: marks tests as slow (deselect with -m 'not slow')",
+    "slow: concurrency torture tests (seconds, not milliseconds)",
     # "integration: requires external services",
     # "live: hits the real network/browser",
     #  ^ uncomment to declare it, then append `-m 'not live'` to addopts above so the

@@ -1,19 +1,20 @@
 """The transaction envelope: the library's public API.
 
 A `Lake` wraps an `ObjectStore` and a local working directory. Writers use
-`lake.transaction()` — fetch the current generation, run SQL against a
-local copy via the stock ducklake extension, then publish catalog + CAS
-the root. Readers use `lake.reader()`, which is just the frozen-DuckLake
-pattern: resolve the root, attach that generation READ_ONLY.
-
-P1 scope: single-writer happy path. A lost CAS raises ConflictAbortError;
-the rebase/replay loop lands in P2.
+`lake.transaction()` — SQL runs against a local copy of the current
+catalog generation via the stock ducklake extension, is recorded as a
+logical changeset, then committed by publishing the new generation and
+CASing the root. On a lost race, `decide_rebase` chooses between replaying
+the changeset onto the winner's generation and aborting to the caller.
+Readers use `lake.reader()` — the frozen-DuckLake pattern.
 """
 
 from __future__ import annotations
 
 import os
+import random
 import socket
+import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -26,14 +27,31 @@ from ducklake_serverless.engine import (
     probe_ducklake_format_version,
 )
 from ducklake_serverless.errors import (
+    AmbiguousCasError,
     ConditionalConflictError,
     ConflictAbortError,
     PreconditionFailedError,
     VersionMismatchError,
 )
 from ducklake_serverless.generation import GenerationCache, publish_generation
-from ducklake_serverless.models import RootDoc, WriterInfo
-from ducklake_serverless.root import bootstrap_root, publish_root, read_root
+from ducklake_serverless.models import (
+    Abort,
+    Changeset,
+    CommitResult,
+    ConflictPolicy,
+    RootDoc,
+    Statement,
+    WriterInfo,
+)
+from ducklake_serverless.rebase import decide_rebase
+from ducklake_serverless.recorder import record
+from ducklake_serverless.root import (
+    CasOutcome,
+    bootstrap_root,
+    publish_root,
+    read_root,
+    resolve_cas,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -41,26 +59,57 @@ if TYPE_CHECKING:
 
     from ducklake_serverless.objectstore import ObjectStore
 
+DEFAULT_MAX_ATTEMPTS = 5
+_BACKOFF_BASE_S = 0.05
+_BACKOFF_CAP_S = 2.0
+
 
 def _writer_info() -> WriterInfo:
     return WriterInfo(lib_version=__version__, host=socket.gethostname(), pid=os.getpid())
 
 
+def _backoff(attempt: int) -> None:
+    delay: float = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2.0**attempt))
+    jitter: float = random.uniform(0, delay)  # noqa: S311  # jitter, not crypto
+    time.sleep(jitter)
+
+
 class Transaction:
-    """One open transaction: SQL runs against a private catalog copy."""
+    """One open transaction: SQL runs against a private catalog copy.
+
+    Every statement is classified and recorded at this boundary — the
+    recording is what makes replay-on-conflict possible.
+    """
 
     def __init__(self, connection: LakeConnection) -> None:
         self._connection = connection
+        self._recorded: list[Statement] = []
 
     def sql(self, statement: str, params: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
-        """Execute one statement inside the transaction."""
-        return self._connection.execute(statement, params)
+        """Classify, record, and execute one statement."""
+        stmt = record(statement, params)
+        rows = self._connection.execute(statement, params)
+        self._recorded.append(stmt)
+        return rows
+
+    @property
+    def changeset(self) -> Changeset:
+        """The statements recorded so far, in execution order."""
+        return Changeset(statements=tuple(self._recorded))
 
 
 class Lake:
     """A serverless DuckLake rooted at one object-store prefix."""
 
-    def __init__(self, store: ObjectStore, workdir: Path, data_path: str) -> None:
+    def __init__(
+        self,
+        store: ObjectStore,
+        workdir: Path,
+        data_path: str,
+        *,
+        conflict_policy: ConflictPolicy = ConflictPolicy.APPEND_ONLY_REPLAY,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    ) -> None:
         """Bind the lake to a store, a scratch dir, and a Parquet destination.
 
         `data_path` is where DuckDB writes Parquet — an s3:// URL in
@@ -71,6 +120,8 @@ class Lake:
         self._workdir = workdir
         self._data_path = data_path.rstrip("/")
         self._cache = GenerationCache(store, workdir)
+        self._conflict_policy = conflict_policy
+        self._max_attempts = max_attempts
 
     def bootstrap(self) -> RootDoc:
         """Create generation 0 (an empty DuckLake catalog) and the root.
@@ -98,40 +149,79 @@ class Lake:
     def transaction(self) -> Generator[Transaction]:
         """Run SQL against the lake and commit it as one new generation.
 
-        Raises ConflictAbortError if another writer commits first (P1: no
-        rebase yet), VersionMismatchError if local DuckDB/DuckLake versions
-        differ from the lake's, and AmbiguousCasError only after resolution
-        failed (P2 wires resolve_cas into the retry loop).
+        On a lost CAS race the recorded changeset is either replayed onto
+        the winner's generation (blind appends, or replay_all policy) or
+        the whole call raises ConflictAbortError. VersionMismatchError if
+        local versions differ from the lake's pins.
         """
         base, etag = read_root(self._store)
         self._check_versions(base)
 
         work = self._cache.fetch_copy(base.generation, base.catalog_uuid)
         connection = LakeConnection(work, self._data_path)
+        transaction = Transaction(connection)
         try:
-            yield Transaction(connection)
+            yield transaction
         except BaseException:
             connection.abandon()
             raise
         connection.close()
 
-        new_uuid = uuid4()
-        publish_generation(self._store, work, base.generation + 1, new_uuid)
-        new_doc = base.model_copy(
-            update={
-                "generation": base.generation + 1,
-                "catalog_uuid": new_uuid,
-                "created_at": datetime.now(tz=UTC),
-                "writer": _writer_info(),
-            }
-        )
+        self._commit(work, base, etag, transaction.changeset)
+
+    def _commit(self, work: Path, base: RootDoc, etag: str, changeset: Changeset) -> CommitResult:
+        """Publish + CAS, replaying onto newer generations until won or aborted."""
+        attempt = 0
+        while True:
+            new_uuid = uuid4()
+            publish_generation(self._store, work, base.generation + 1, new_uuid)
+            new_doc = base.model_copy(
+                update={
+                    "generation": base.generation + 1,
+                    "catalog_uuid": new_uuid,
+                    "created_at": datetime.now(tz=UTC),
+                    "writer": _writer_info(),
+                }
+            )
+            try:
+                publish_root(self._store, new_doc, etag)
+                return CommitResult(
+                    generation=new_doc.generation,
+                    catalog_uuid=new_uuid,
+                    attempts=attempt + 1,
+                )
+            except (PreconditionFailedError, ConditionalConflictError):
+                base, etag = read_root(self._store)
+            except AmbiguousCasError:
+                outcome, current, current_etag = resolve_cas(self._store, new_uuid)
+                if outcome is CasOutcome.WON:
+                    return CommitResult(
+                        generation=current.generation,
+                        catalog_uuid=new_uuid,
+                        attempts=attempt + 1,
+                    )
+                base, etag = current, current_etag
+
+            attempt += 1
+            decision = decide_rebase(changeset, self._conflict_policy, attempt, self._max_attempts)
+            if isinstance(decision, Abort):
+                raise ConflictAbortError(decision.reason)
+            _backoff(attempt)
+            work = self._replay(base, changeset)
+
+    def _replay(self, winner: RootDoc, changeset: Changeset) -> Path:
+        """Re-execute the changeset against a fresh copy of the winner's catalog."""
+        self._check_versions(winner)
+        work = self._cache.fetch_copy(winner.generation, winner.catalog_uuid)
+        connection = LakeConnection(work, self._data_path)
         try:
-            publish_root(self._store, new_doc, etag)
-        except (PreconditionFailedError, ConditionalConflictError) as exc:
-            # P2 replaces this with the rebase/replay loop.
-            raise ConflictAbortError(
-                "another writer committed first; re-read and retry the transaction"
-            ) from exc
+            for statement in changeset.statements:
+                connection.execute(statement.sql, statement.params)
+        except BaseException:
+            connection.abandon()
+            raise
+        connection.close()
+        return work
 
     @contextmanager
     def reader(self) -> Generator[LakeConnection]:
