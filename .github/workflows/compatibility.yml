@@ -1,0 +1,157 @@
+name: compatibility
+
+# Live-tests the S3 conditional-write compatibility table (docs/compatibility.md).
+# Backend versions are PINNED; Renovate bumps them. Each backend asserts its
+# EXPECTED verdict, so a bump that changes conditional-write behavior fails
+# this workflow on exactly the version that changed the answer — that failure
+# is news (update the expectation + table), not a broken build.
+
+on:
+  schedule:
+    - cron: "43 6 * * 1" # weekly, Monday 06:43 UTC (off the :00 stampede)
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/compatibility.yml"
+      - "scripts/compat_probe.py"
+      - "scripts/compat_report.py"
+
+concurrency:
+  group: compatibility-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # commits docs/compatibility.md when it changes
+
+env:
+  # Renovate-managed pins (see renovate.json customManagers).
+  # renovate: datasource=docker depName=minio/minio
+  MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
+  # renovate: datasource=docker depName=chrislusf/seaweedfs
+  SEAWEEDFS_VERSION: "4.38"
+  # renovate: datasource=docker depName=dxflrs/garage
+  GARAGE_VERSION: v2.3.0
+  # renovate: datasource=docker depName=rclone/rclone
+  RCLONE_VERSION: 1.74.3
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install deps
+        run: uv sync --frozen
+
+      - name: Start backends
+        run: |
+          mkdir -p results
+
+          docker run -d --name minio -p 9001:9000 \
+            -e MINIO_ROOT_USER=probe -e MINIO_ROOT_PASSWORD=probeprobe \
+            "minio/minio:${MINIO_VERSION}" server /data
+
+          docker run -d --name seaweedfs -p 9002:8333 \
+            "chrislusf/seaweedfs:${SEAWEEDFS_VERSION}" \
+            server -s3 -s3.port=8333 -ip=0.0.0.0
+
+          docker run -d --name rclone -p 9003:9003 \
+            "rclone/rclone:${RCLONE_VERSION}" \
+            serve s3 /data --addr :9003 --auth-key probe,probeprobe
+
+          # garage needs config + layout + bucket + key setup
+          cat > /tmp/garage.toml <<'EOF'
+          metadata_dir = "/var/lib/garage/meta"
+          data_dir = "/var/lib/garage/data"
+          db_engine = "sqlite"
+          replication_factor = 1
+          rpc_bind_addr = "0.0.0.0:3901"
+          rpc_public_addr = "127.0.0.1:3901"
+          rpc_secret = "1799bccfd7411eddcf9ebd316bc1f5287ad12a68094e1c6ac6abde7e6feae1ec"
+          [s3_api]
+          s3_region = "garage"
+          api_bind_addr = "0.0.0.0:3900"
+          [admin]
+          api_bind_addr = "0.0.0.0:3903"
+          admin_token = "probe-admin-token"
+          EOF
+          docker run -d --name garage -p 9004:3900 \
+            -v /tmp/garage.toml:/etc/garage.toml \
+            "dxflrs/garage:${GARAGE_VERSION}"
+
+      - name: Wait for backends and finish garage setup
+        run: |
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9001/minio/health/ready && break; sleep 2
+          done
+          for _ in $(seq 1 45); do
+            curl -sf -o /dev/null http://127.0.0.1:9002/ && break; sleep 2
+          done
+          for _ in $(seq 1 30); do
+            curl -sf -o /dev/null http://127.0.0.1:9003/ && break; sleep 2
+          done
+          sleep 5
+          NODE=$(docker exec garage /garage status | awk '/^[0-9a-f]{16}/ {print $1; exit}')
+          docker exec garage /garage layout assign -z z1 -c 1G "$NODE"
+          docker exec garage /garage layout apply --version 1
+          docker exec garage /garage bucket create compat-probe
+          KEY_INFO=$(docker exec garage /garage key create probe-key)
+          GARAGE_KEY=$(echo "$KEY_INFO" | awk '/Key ID:/ {print $3}')
+          GARAGE_SECRET=$(echo "$KEY_INFO" | awk '/Secret key:/ {print $3}')
+          docker exec garage /garage bucket allow --read --write --owner compat-probe --key probe-key
+          echo "GARAGE_KEY=$GARAGE_KEY" >> "$GITHUB_ENV"
+          echo "GARAGE_SECRET=$GARAGE_SECRET" >> "$GITHUB_ENV"
+
+      - name: Probe all backends
+        run: |
+          set +e
+          fail=0
+          uv run python scripts/compat_probe.py --backend MinIO \
+            --version "$MINIO_VERSION" --expected enforce \
+            --endpoint http://127.0.0.1:9001 \
+            --access-key probe --secret-key probeprobe \
+            --out results/1-minio.json || fail=1
+          uv run python scripts/compat_probe.py --backend SeaweedFS \
+            --version "$SEAWEEDFS_VERSION" --expected enforce \
+            --endpoint http://127.0.0.1:9002 \
+            --out results/2-seaweedfs.json || fail=1
+          uv run python scripts/compat_probe.py --backend moto \
+            --version moto --expected enforce \
+            --out results/3-moto.json || fail=1
+          uv run python scripts/compat_probe.py --backend "garage" \
+            --version "$GARAGE_VERSION" --expected ignore \
+            --endpoint http://127.0.0.1:9004 \
+            --access-key "$GARAGE_KEY" --secret-key "$GARAGE_SECRET" \
+            --out results/4-garage.json || fail=1
+          uv run python scripts/compat_probe.py --backend "rclone serve s3" \
+            --version "$RCLONE_VERSION" --expected ignore \
+            --endpoint http://127.0.0.1:9003 \
+            --access-key probe --secret-key probeprobe \
+            --out results/5-rclone.json || fail=1
+          exit $fail
+
+      - name: Render table
+        if: always()
+        run: uv run python scripts/compat_report.py results
+
+      - name: Commit table if changed
+        if: always() && github.ref == 'refs/heads/main'
+        run: |
+          if ! git diff --quiet docs/compatibility.md 2>/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add docs/compatibility.md
+            git commit -m "docs: refresh live compatibility table [skip ci]"
+            git push
+          fi

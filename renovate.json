@@ -1,0 +1,23 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", ":semanticCommits"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": { "enabled": true, "schedule": ["before 7am on monday"] },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Backend image pins in workflow env blocks (compatibility + integration)",
+      "managerFilePatterns": ["/^\\.github/workflows/.*\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\n\\s+[A-Z_]+_VERSION: \"?(?<currentValue>[^\\s\"]+)\"?"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Compatibility-probe backends: bumps re-run the probe; a verdict change fails the PR on exactly the version that changed behavior",
+      "matchDepNames": ["minio/minio", "chrislusf/seaweedfs", "dxflrs/garage", "rclone/rclone"],
+      "groupName": "s3-backend-probes"
+    }
+  ]
+}

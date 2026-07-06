@@ -13,6 +13,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: write # cache-nix-action purge writes to the GHA cache API
 
 jobs:
   check:
@@ -37,29 +38,30 @@ jobs:
       - name: Inner loop (uv)
         run: make check
 
-      # nix path — only if the user kept flake.nix
+      # Nix leg: prove the uv2nix wiring resolves end-to-end (project + deps
+      # build under pure Nix) and run flake checks. The full test suite already
+      # ran once above under uv — same interpreter, same deps via uv.lock —
+      # so re-running it inside nix develop would double CI time for no signal.
       - name: Install Nix
-        if: ${{ hashFiles('flake.nix') != '' }}
-        uses: cachix/install-nix-action@v30
+        uses: cachix/install-nix-action@v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      - name: Inner loop (nix develop)
-        if: ${{ hashFiles('flake.nix') != '' }}
-        run: nix develop -c make check
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-check-${{ hashFiles('flake.lock', 'uv.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-check-
+          gc-max-store-size-linux: 5368709120
+          purge: true
+          purge-prefixes: nix-${{ runner.os }}-check-
+          purge-created: 604800
 
-      # Proves the uv2nix wiring resolves end-to-end: project + deps build
-      # under pure Nix (no uv at build time). Catches lockfile drift and
-      # missing build-backend overrides early.
       - name: Build venv (nix)
-        if: ${{ hashFiles('flake.nix') != '' }}
         run: nix build .#default --print-build-logs
 
-      # Runs `checks.${system}.*` from flake.nix: statix + nixfmt --check.
-      # Also re-evaluates devShells/packages/inputs as a smoke test.
       - name: Flake check (statix + nixfmt)
-        if: ${{ hashFiles('flake.nix') != '' }}
         run: nix flake check --print-build-logs
 
   # Same suite against two independent S3 implementations. Cross-implementation
@@ -68,11 +70,16 @@ jobs:
   # fixture instantly instead of passing vacuously.
   integration:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         backend: [minio, seaweedfs]
+    env:
+      # renovate: datasource=docker depName=minio/minio
+      MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
+      # renovate: datasource=docker depName=chrislusf/seaweedfs
+      SEAWEEDFS_VERSION: "4.38"
     steps:
       - uses: actions/checkout@v4
 
@@ -83,7 +90,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio:latest server /data
+            "minio/minio:${MINIO_VERSION}" server /data
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:9000/minio/health/ready && exit 0
             sleep 2
@@ -99,7 +106,7 @@ jobs:
         if: matrix.backend == 'seaweedfs'
         run: |
           docker run -d --name seaweedfs -p 9000:8333 \
-            chrislusf/seaweedfs:latest \
+            "chrislusf/seaweedfs:${SEAWEEDFS_VERSION}" \
             server -s3 -s3.port=8333 -ip=0.0.0.0
           for _ in $(seq 1 45); do
             curl -sf -o /dev/null http://127.0.0.1:9000/ && exit 0

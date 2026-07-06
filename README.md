@@ -34,10 +34,13 @@ supported by AWS S3 (since 2024), GCS, Azure, R2, MinIO, and iDrive E2
 (verified empirically).
 
 **Verify your endpoint before trusting it**: some S3-compatible stores
-accept `If-Match`/`If-None-Match` headers without enforcing them (garage
-1.3.1 does — every conditional PUT "succeeds"), which would corrupt a lake
-with zero errors. `verify_conditional_writes(store)` probes this in one
-round-trip; the integration and live test lanes run it automatically.
+accept `If-Match`/`If-None-Match` headers without enforcing them, which
+would corrupt a lake with zero errors. See the
+[live-tested compatibility table](docs/compatibility.md) — re-verified
+weekly in CI and on every backend version bump, so it cannot go stale.
+`verify_conditional_writes(store)` runs the same probe against any
+endpoint in one round-trip; the integration and live test lanes run it
+automatically.
 
 ## Concurrency semantics
 
