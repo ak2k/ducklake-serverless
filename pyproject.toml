@@ -110,7 +110,7 @@ reportAny = "warning"  # flags Any-typed expressions; basedpyright-only
 # --- pytest ---
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --strict-config -m 'not live' --cov=src --cov-report=term-missing:skip-covered"
+addopts = "-ra --strict-markers --strict-config -m 'not live and not integration' --cov=src --cov-report=term-missing:skip-covered"
 xfail_strict = true
 filterwarnings = [
     "error",  # deprecations become test failures — catch early
@@ -120,9 +120,10 @@ markers = [
     # Pre-declare custom markers here; `--strict-markers` rejects undeclared ones.
     "slow: concurrency torture tests (seconds, not milliseconds)",
     "live: opt-in tests against a real S3-compatible endpoint (DUCKLAKE_LIVE_*)",
+    "integration: opt-in tests against MinIO or another S3 API (DUCKLAKE_IT_*)",
     # "integration: requires external services",
     # "live: hits the real network/browser",
-    #  ^ uncomment to declare it, then append `-m 'not live'` to addopts above so the
+    #  ^ uncomment to declare it, then append `-m 'not live and not integration'` to addopts above so the
     #    inner loop stays hermetic (CI opts in by dropping that filter).
 ]
 

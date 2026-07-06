@@ -10,6 +10,7 @@ DuckDB file, never through a ducklake ATTACH.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import duckdb
@@ -53,6 +54,22 @@ def probe_ducklake_format_version(catalog_path: Path) -> str:
     return str(row[0])  # pyright: ignore[reportAny]  # duckdb rows are untyped; version is TEXT
 
 
+@dataclass(frozen=True)
+class S3Credentials:
+    """Connection settings for DuckDB's httpfs when DATA_PATH is s3://.
+
+    Becomes a session-scoped `CREATE SECRET` — never interpolated into
+    user SQL, never persisted into the catalog file.
+    """
+
+    access_key_id: str
+    secret_access_key: str
+    endpoint: str | None = None  # host[:port], no scheme
+    region: str = "us-east-1"
+    use_ssl: bool = True
+    url_style: str = "path"  # S3-compatible stores generally need path-style
+
+
 class LakeConnection:
     """A DuckDB connection with one local DuckLake catalog attached as `lake`."""
 
@@ -62,10 +79,13 @@ class LakeConnection:
         data_path: str | None,
         *,
         read_only: bool = False,
+        s3_credentials: S3Credentials | None = None,
     ) -> None:
         self._con = duckdb.connect()
         try:
             self._con.execute("INSTALL ducklake; LOAD ducklake;")
+            if s3_credentials is not None:
+                self._create_s3_secret(s3_credentials)
             options = ["READ_ONLY"] if read_only else []
             if data_path is not None:
                 options.append(f"DATA_PATH '{data_path}'")
@@ -75,6 +95,24 @@ class LakeConnection:
         except duckdb.Error as exc:
             self._con.close()
             raise ExternalServiceError(f"attach failed for {catalog_path}") from exc
+
+    def _create_s3_secret(self, creds: S3Credentials) -> None:
+        """Install httpfs and register a session-scoped S3 secret."""
+        self._con.execute("INSTALL httpfs; LOAD httpfs;")
+        clauses = [
+            "TYPE s3",
+            "KEY_ID ?",
+            "SECRET ?",
+            "REGION ?",
+            f"URL_STYLE '{creds.url_style}'",
+            f"USE_SSL {'true' if creds.use_ssl else 'false'}",
+        ]
+        params: list[str] = [creds.access_key_id, creds.secret_access_key, creds.region]
+        if creds.endpoint is not None:
+            clauses.append("ENDPOINT ?")
+            params.append(creds.endpoint)
+        sql = f"CREATE SECRET lake_s3 ({', '.join(clauses)})"
+        self._con.execute(sql, params)  # pyright: ignore[reportUnknownMemberType]
 
     def execute(self, sql: str, params: tuple[object, ...] = ()) -> list[tuple[object, ...]]:
         """Run one statement; returns fetched rows (empty for DML/DDL)."""

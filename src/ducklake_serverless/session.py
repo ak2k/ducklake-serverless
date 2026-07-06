@@ -24,6 +24,7 @@ from ducklake_serverless import __version__
 from ducklake_serverless.engine import (
     DUCKDB_VERSION,
     LakeConnection,
+    S3Credentials,
     probe_ducklake_format_version,
 )
 from ducklake_serverless.errors import (
@@ -112,6 +113,7 @@ class Lake:
         *,
         conflict_policy: ConflictPolicy = ConflictPolicy.APPEND_ONLY_REPLAY,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        s3_credentials: S3Credentials | None = None,
     ) -> None:
         """Bind the lake to a store, a scratch dir, and a Parquet destination.
 
@@ -125,6 +127,7 @@ class Lake:
         self._cache = GenerationCache(store, workdir)
         self._conflict_policy = conflict_policy
         self._max_attempts = max_attempts
+        self._s3_credentials = s3_credentials
 
     def bootstrap(self) -> RootDoc:
         """Create generation 0 (an empty DuckLake catalog) and the root.
@@ -133,7 +136,9 @@ class Lake:
         """
         catalog_uuid = uuid4()
         catalog_path = self._workdir / f"bootstrap-{catalog_uuid}.duckdb"
-        connection = LakeConnection(catalog_path, self._data_path)
+        connection = LakeConnection(
+            catalog_path, self._data_path, s3_credentials=self._s3_credentials
+        )
         connection.close()
 
         try:
@@ -158,7 +163,7 @@ class Lake:
         On success the connection is closed (checkpointing the file) and the
         work copy is left on disk for the caller to publish and discard.
         """
-        connection = LakeConnection(work, self._data_path)
+        connection = LakeConnection(work, self._data_path, s3_credentials=self._s3_credentials)
         try:
             yield connection
         except BaseException:
@@ -333,7 +338,9 @@ class Lake:
     def reader(self) -> Generator[LakeConnection]:
         """Attach the current generation READ_ONLY (frozen-DuckLake pattern)."""
         _, _, path = self._fetch_current_base()
-        connection = LakeConnection(path, data_path=None, read_only=True)
+        connection = LakeConnection(
+            path, data_path=None, read_only=True, s3_credentials=self._s3_credentials
+        )
         try:
             yield connection
         finally:

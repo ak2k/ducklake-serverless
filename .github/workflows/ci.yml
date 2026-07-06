@@ -61,3 +61,41 @@ jobs:
       - name: Flake check (statix + nixfmt)
         if: ${{ hashFiles('flake.nix') != '' }}
         run: nix flake check --print-build-logs
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "mc ready local || curl -sf http://localhost:9000/minio/health/ready"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install deps
+        run: uv sync --frozen
+
+      - name: Integration suite (MinIO)
+        env:
+          DUCKLAKE_IT_ENDPOINT: http://127.0.0.1:9000
+          DUCKLAKE_IT_ACCESS_KEY: minioadmin
+          DUCKLAKE_IT_SECRET_KEY: minioadmin
+        run: uv run pytest -m integration --no-cov -o addopts="" -v
