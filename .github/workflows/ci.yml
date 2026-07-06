@@ -62,15 +62,24 @@ jobs:
         if: ${{ hashFiles('flake.nix') != '' }}
         run: nix flake check --print-build-logs
 
+  # Same suite against two independent S3 implementations. Cross-implementation
+  # agreement is the point: a server that accepts-but-ignores conditional
+  # writes (garage 1.3.1, rclone serve s3) fails the suite's conformance
+  # fixture instantly instead of passing vacuously.
   integration:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [minio, seaweedfs]
     steps:
       - uses: actions/checkout@v4
 
       # The official minio image needs a command argument, which GH service
       # containers cannot pass — run it directly instead.
       - name: Start MinIO
+        if: matrix.backend == 'minio'
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
@@ -81,6 +90,23 @@ jobs:
           done
           echo "minio never became ready" >&2
           docker logs minio >&2
+          exit 1
+
+      # SeaweedFS enforces conditional writes since v3.97 (verified
+      # empirically against 4.36). Single process runs master + volume +
+      # filer + S3; readiness = S3 port answering ListBuckets-ish traffic.
+      - name: Start SeaweedFS
+        if: matrix.backend == 'seaweedfs'
+        run: |
+          docker run -d --name seaweedfs -p 9000:8333 \
+            chrislusf/seaweedfs:latest \
+            server -s3 -s3.port=8333 -ip=0.0.0.0
+          for _ in $(seq 1 45); do
+            curl -sf -o /dev/null http://127.0.0.1:9000/ && exit 0
+            sleep 2
+          done
+          echo "seaweedfs never became ready" >&2
+          docker logs seaweedfs >&2
           exit 1
 
       - name: Install uv
@@ -95,7 +121,7 @@ jobs:
       - name: Install deps
         run: uv sync --frozen
 
-      - name: Integration suite (MinIO)
+      - name: Integration suite (${{ matrix.backend }})
         env:
           DUCKLAKE_IT_ENDPOINT: http://127.0.0.1:9000
           DUCKLAKE_IT_ACCESS_KEY: minioadmin
