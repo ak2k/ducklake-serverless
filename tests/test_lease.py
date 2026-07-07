@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from unittest import mock
 
 from ducklake_serverless.lease import LEASE_KEY, Lease
 from ducklake_serverless.objectstore import InMemoryObjectStore
@@ -90,5 +91,21 @@ def test_release_is_atomic_tombstone_not_delete() -> None:
     lease.release()
     # The key still exists (tombstoned, expired) — and is acquirable.
     body: dict[str, object] = json.loads(store.get(LEASE_KEY).body)  # pyright: ignore[reportAny]
-    assert body["expires_at"] == 0.0
+    assert body["ttl"] == 0.0  # tombstone: zero ttl means instantly expired
     assert Lease(store, "b", ttl_seconds=60).acquire()
+
+
+def test_expiry_uses_store_clock_not_holder_clock() -> None:
+    """A lease from a holder whose clock is far in the FUTURE must still
+
+    expire by the store's clock: skewed holders cannot stretch their leases.
+    """
+    store = InMemoryObjectStore()
+    skewed = Lease(store, "skewed", ttl_seconds=0.01)
+    # Holder writes expires_at with a clock 1 hour fast; ttl is what counts.
+    with mock.patch("ducklake_serverless.lease.time.time", return_value=time.time() + 3600):
+        assert skewed.acquire()
+    time.sleep(0.05)  # let the store-clock ttl lapse
+    # Store-clock arithmetic sees the lease as expired despite the huge
+    # holder-clock expires_at; takeover must succeed.
+    assert Lease(store, "honest", ttl_seconds=60).acquire()

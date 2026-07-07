@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Protocol
 
@@ -50,10 +51,16 @@ def make_s3_client(endpoint_url: str | None = None, region_name: str | None = No
 
 @dataclass(frozen=True)
 class GetResult:
-    """An object's body plus the ETag needed for a later conditional PUT."""
+    """An object's body, its ETag, and the store's write timestamp.
+
+    `last_modified` is the STORE's clock (S3 LastModified), not any
+    writer's — the one timestamp all participants can agree on. None when
+    a backend doesn't provide it.
+    """
 
     body: bytes
     etag: str
+    last_modified: datetime | None = None
 
 
 class ObjectStore(Protocol):
@@ -107,7 +114,11 @@ class S3ObjectStore:
             if _error_code(exc) in ("NoSuchKey", "404"):
                 raise ObjectNotFoundError(key) from exc
             raise ExternalServiceError(f"get {key!r}") from exc
-        return GetResult(body=resp["Body"].read(), etag=resp["ETag"].strip('"'))
+        return GetResult(
+            body=resp["Body"].read(),
+            etag=resp["ETag"].strip('"'),
+            last_modified=resp.get("LastModified"),
+        )
 
     def put_if_absent(self, key: str, body: bytes) -> str:
         """Create-only PUT via `If-None-Match: *`."""
@@ -225,7 +236,7 @@ class InMemoryObjectStore:
     """
 
     def __init__(self) -> None:
-        self._objects: dict[str, tuple[bytes, str]] = {}
+        self._objects: dict[str, tuple[bytes, str, datetime]] = {}
         self._etag_counter = 0
         self._lock = threading.Lock()
 
@@ -237,10 +248,10 @@ class InMemoryObjectStore:
         """Fetch an object body and its ETag."""
         with self._lock:
             try:
-                body, etag = self._objects[key]
+                body, etag, written = self._objects[key]
             except KeyError:
                 raise ObjectNotFoundError(key) from None
-            return GetResult(body=body, etag=etag)
+            return GetResult(body=body, etag=etag, last_modified=written)
 
     def put_if_absent(self, key: str, body: bytes) -> str:
         """Create-only PUT; fails if the key already exists."""
@@ -248,7 +259,7 @@ class InMemoryObjectStore:
             if key in self._objects:
                 raise PreconditionFailedError(key)
             etag = self._next_etag()
-            self._objects[key] = (body, etag)
+            self._objects[key] = (body, etag, datetime.now(tz=UTC))
             return etag
 
     def put_if_match(self, key: str, body: bytes, etag: str) -> str:
@@ -261,7 +272,7 @@ class InMemoryObjectStore:
             if current[1] != etag:
                 raise PreconditionFailedError(key)
             new_etag = self._next_etag()
-            self._objects[key] = (body, new_etag)
+            self._objects[key] = (body, new_etag, datetime.now(tz=UTC))
             return new_etag
 
     def list_prefix(self, prefix: str) -> list[str]:

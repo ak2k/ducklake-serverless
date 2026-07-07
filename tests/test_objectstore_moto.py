@@ -10,6 +10,7 @@ support).
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, override
 
 import boto3
@@ -122,14 +123,14 @@ def test_verify_conditional_writes_rejects_ignoring_store() -> None:
         def put_if_absent(self, key: str, body: bytes) -> str:
             with self._lock:  # pyright: ignore[reportPrivateUsage]
                 etag = self._next_etag()  # pyright: ignore[reportPrivateUsage]
-                self._objects[key] = (body, etag)  # pyright: ignore[reportPrivateUsage]
+                self._objects[key] = (body, etag, datetime.now(tz=UTC))  # pyright: ignore[reportPrivateUsage]
                 return etag
 
         @override
         def put_if_match(self, key: str, body: bytes, etag: str) -> str:
             with self._lock:  # pyright: ignore[reportPrivateUsage]
                 new_etag = self._next_etag()  # pyright: ignore[reportPrivateUsage]
-                self._objects[key] = (body, new_etag)  # pyright: ignore[reportPrivateUsage]
+                self._objects[key] = (body, new_etag, datetime.now(tz=UTC))  # pyright: ignore[reportPrivateUsage]
                 return new_etag
 
     with pytest.raises(ExternalServiceError, match="does not enforce"):

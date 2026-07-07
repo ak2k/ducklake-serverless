@@ -3,13 +3,19 @@
 The commit path never uses leases — CAS on the root is its only
 coordination. Leases exist for background maintenance (GC/compaction)
 where "at most one runner fleet-wide" is wanted and a crashed holder must
-not block forever. Expiry is computed from the store's LastModified-style
-server time... except ObjectStore has no timestamps, so the lease body
-carries an `expires_at` epoch written by the holder. Clock skew between
-maintenance hosts therefore erodes the guarantee at the margin — TTLs
-should be minutes, not milliseconds, and lease consumers must stay safe
-under brief holder overlap (GC is: swept keys are immutable garbage, so
-overlapping sweeps are idempotent — see gc.py's module docstring).
+not block forever.
+
+Clock discipline: expiry is anchored to the STORE's clock, not any
+holder's. The lease body carries only `{holder, ttl}`; a would-be taker
+computes expiry as the lease object's `last_modified` (S3 server time)
+plus its ttl, compared against the same server's time as observed via a
+freshly-written probe. Holders' wall clocks never enter the comparison,
+so maintenance hosts with skewed clocks cannot shorten or stretch each
+other's leases. (Ported from the haystack S3Lease pattern, which got
+this right first.) Residual skew is only the store's own clock drift
+between two of its writes — negligible. Lease consumers must still stay
+safe under brief holder overlap (GC is: swept keys are immutable garbage,
+so overlapping sweeps are idempotent — see gc.py's module docstring).
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+import uuid
 from typing import TYPE_CHECKING
 
 from ducklake_serverless.errors import (
@@ -48,8 +55,45 @@ class Lease:
         self._ttl = ttl_seconds
         self._etag: str | None = None
 
-    def _body(self) -> bytes:
-        return json.dumps({"holder": self._holder, "expires_at": time.time() + self._ttl}).encode()
+    def _body(self, ttl: float | None = None) -> bytes:
+        effective = ttl if ttl is not None else self._ttl
+        return json.dumps(
+            {
+                "holder": self._holder,
+                "ttl": effective,
+                # Holder-clock fallback, used ONLY when the store reports no
+                # timestamps; store time is authoritative when present.
+                "expires_at": time.time() + effective,
+            }
+        ).encode()
+
+    def _remaining(self) -> tuple[float, str] | None:
+        """Seconds left on the current lease and its etag, or None if absent.
+
+        Both timestamps come from the store: the lease object's
+        last_modified, and 'now' as the last_modified of a probe object we
+        just wrote. When the backend reports no timestamps, fall back to
+        local time for 'now' only (single-clock comparison degrades to the
+        old holder-clock behavior, never to something worse).
+        """
+        try:
+            current = self._store.get(self._key)
+        except ObjectNotFoundError:
+            return None
+        _, ttl, expires_at = _parse(current.body)
+        if current.last_modified is None:
+            # Timestampless backend: degrade to the holder-clock expiry.
+            return (expires_at - time.time(), current.etag)
+        probe_key = f"{self._key}.now-probe-{uuid.uuid4()}"
+        self._store.put_if_absent(probe_key, b"t")
+        try:
+            now_dt = self._store.get(probe_key).last_modified
+        finally:
+            self._store.delete(probe_key)
+        if now_dt is None:  # store gave a timestamp once but not twice — degrade likewise
+            return (expires_at - time.time(), current.etag)
+        elapsed = (now_dt - current.last_modified).total_seconds()
+        return (ttl - elapsed, current.etag)
 
     def acquire(self) -> bool:
         """Try to take the lease. True iff we now hold it.
@@ -65,21 +109,24 @@ class Lease:
         else:
             return True
 
-        try:
-            current = self._store.get(self._key)
-        except ObjectNotFoundError:
+        remaining = self._remaining()
+        if remaining is None:
             return self.acquire()  # holder released between our calls
-        holder, expires_at = _parse(current.body)
-        if holder != self._holder and expires_at > time.time():
+        seconds_left, etag = remaining
+        try:
+            holder, _, _ = _parse(self._store.get(self._key).body)
+        except ObjectNotFoundError:
+            return self.acquire()
+        if holder != self._holder and seconds_left > 0:
             return False
         try:
-            self._etag = self._store.put_if_match(self._key, self._body(), current.etag)
+            self._etag = self._store.put_if_match(self._key, self._body(), etag)
         except (PreconditionFailedError, ConditionalConflictError, ObjectNotFoundError):
             return False  # lost the takeover race
         return True
 
     def renew(self) -> bool:
-        """Extend the lease. True iff still held after the call."""
+        """Extend the lease (rewrites it, resetting last_modified). True iff held."""
         if self._etag is None:
             return False
         try:
@@ -94,24 +141,27 @@ class Lease:
 
         A check-then-delete could remove a successor's live lease taken
         over between the check and the delete. Overwriting our own lease
-        with an already-expired body via If-Match is atomic: it succeeds
-        only while we still hold it, and the tombstone is immediately
+        with a zero-ttl body via If-Match is atomic: it succeeds only
+        while we still hold it, and the tombstone is immediately
         acquirable by anyone.
         """
         if self._etag is None:
             return
-        tombstone = json.dumps({"holder": self._holder, "expires_at": 0.0}).encode()
         with contextlib.suppress(
             PreconditionFailedError, ConditionalConflictError, ObjectNotFoundError
         ):  # a successor already took over — nothing of ours to release
-            self._store.put_if_match(self._key, tombstone, self._etag)
+            self._store.put_if_match(self._key, self._body(ttl=0.0), self._etag)
         self._etag = None
 
 
-def _parse(body: bytes) -> tuple[str, float]:
+def _parse(body: bytes) -> tuple[str, float, float]:
     """Parse a lease body; malformed bodies read as expired-and-unowned."""
     try:
         doc: dict[str, object] = json.loads(body)  # pyright: ignore[reportAny]  # validated below
-        return str(doc["holder"]), float(doc["expires_at"])  # pyright: ignore[reportArgumentType]  # ValueError caught
+        return (
+            str(doc["holder"]),
+            float(doc["ttl"]),  # pyright: ignore[reportArgumentType]  # ValueError caught
+            float(doc["expires_at"]),  # pyright: ignore[reportArgumentType]
+        )
     except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-        return "<corrupt>", 0.0
+        return "<corrupt>", 0.0, 0.0
