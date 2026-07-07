@@ -17,6 +17,7 @@ import random
 import socket
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
@@ -44,6 +45,7 @@ from ducklake_serverless.models import (
     Changeset,
     CommitResult,
     ConflictPolicy,
+    Replay,
     RootDoc,
     Statement,
     WriterInfo,
@@ -104,6 +106,35 @@ class Transaction:
     def changeset(self) -> Changeset:
         """The statements recorded so far, in execution order."""
         return Changeset(statements=tuple(self._recorded))
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    """Commit phase: publish + create the marker at `base.generation + 1`."""
+
+    base: RootDoc
+    work: Path
+    attempt: int
+
+
+@dataclass(frozen=True)
+class _Committed:
+    """Terminal commit phase: the marker landed (created, or resolved WON)."""
+
+    result: CommitResult
+
+
+@dataclass(frozen=True)
+class _Aborted:
+    """Terminal commit phase: lost the race and the changeset can't replay."""
+
+    reason: str
+
+
+# The commit loop is a small state machine over these phases: it only ever
+# sequences whatever `_advance` returns, and the terminal phases exit on match,
+# so an illegal transition (e.g. continuing after Committed) is unrepresentable.
+_CommitPhase = _Attempt | _Committed | _Aborted
 
 
 class Lake:
@@ -183,12 +214,15 @@ class Lake:
                 created_at=datetime.now(tz=UTC),
                 writer=_writer_info(),
             )
-            if self._create_marker_resolving(doc, catalog_uuid, 0) is MarkerOutcome.LOST:
-                # A concurrent bootstrap won generation 0; adopt its (equally
-                # empty) lake. Our orphan catalog is swept by GC later. (WON
-                # falls through; ABSENT is retried inside the helper, so
-                # read_marker(0) below never races a not-yet-created marker.)
-                return read_marker(self._store, 0)
+            match self._create_marker_resolving(doc, catalog_uuid, 0):
+                case MarkerOutcome.WON:
+                    pass  # we created generation 0 — publish the hint below
+                case MarkerOutcome.LOST:
+                    # A concurrent bootstrap won generation 0; adopt its
+                    # (equally empty) lake. Our orphan catalog is swept later.
+                    return read_marker(self._store, 0)
+                case MarkerOutcome.ABSENT:  # helper retries ABSENT, never returns it
+                    raise AssertionError("_create_marker_resolving returned ABSENT")
         finally:
             GenerationCache.discard(catalog_path)
         write_hint(self._store, 0)
@@ -273,40 +307,59 @@ class Lake:
         A marker create is create-only, so both a 412 (someone won this
         generation) and an ambiguous outcome resolve by GETting the marker:
         our uuid means WON (permanent — the marker is immutable and immortal),
-        anyone else's means LOST, absent means our create never landed.
+        anyone else's means LOST, absent means our create never landed. Runs as
+        a small state machine (see `_CommitPhase`): each `_advance` performs one
+        attempt and returns the next phase; terminals exit here.
         """
-        attempt = 0
+        phase: _CommitPhase = _Attempt(base=base, work=work, attempt=0)
         while True:
-            target = base.generation + 1
-            new_uuid = uuid4()
-            self._check_format_unmigrated(work, base)
-            if not self._publish_generation_resolved(work, target, new_uuid, attempt):
-                attempt += 1
+            match phase:
+                case _Committed():
+                    return phase.result
+                case _Aborted():
+                    raise ConflictAbortError(phase.reason)
+                case _Attempt():
+                    phase = self._advance(phase, changeset)
+
+    def _advance(self, phase: _Attempt, changeset: Changeset) -> _CommitPhase:
+        """Run one commit attempt and return the next phase.
+
+        Publish the catalog and create the marker at `base.generation + 1`. A
+        GC-race on publish retries the same base; a win commits; a loss consults
+        `decide_rebase` — abort, or rebase onto the current HEAD (not just the
+        collided marker — a stale writer must not burn one attempt per
+        generation of lag) and try the next generation.
+        """
+        target = phase.base.generation + 1
+        new_uuid = uuid4()
+        self._check_format_unmigrated(phase.work, phase.base)
+        if not self._publish_generation_resolved(phase.work, target, new_uuid, phase.attempt):
+            next_attempt = phase.attempt + 1
+            _backoff(next_attempt)
+            return _Attempt(base=phase.base, work=phase.work, attempt=next_attempt)
+        new_doc = phase.base.model_copy(
+            update={
+                "generation": target,
+                "catalog_uuid": new_uuid,
+                "created_at": datetime.now(tz=UTC),
+                "writer": _writer_info(),
+            }
+        )
+
+        result = self._try_create_marker(new_doc, new_uuid, phase.attempt)
+        if result is not None:
+            return _Committed(result=result)
+
+        attempt = phase.attempt + 1
+        decision = decide_rebase(changeset, self._conflict_policy, attempt, self._max_attempts)
+        match decision:
+            case Abort():
+                return _Aborted(reason=decision.reason)
+            case Replay():
                 _backoff(attempt)
-                continue
-            new_doc = base.model_copy(
-                update={
-                    "generation": target,
-                    "catalog_uuid": new_uuid,
-                    "created_at": datetime.now(tz=UTC),
-                    "writer": _writer_info(),
-                }
-            )
-
-            result = self._try_create_marker(new_doc, new_uuid, attempt)
-            if result is not None:
-                return result
-
-            # Lost this generation: honor the conflict policy, then rebase onto
-            # the current HEAD (not just the collided marker — a stale writer
-            # must not burn one attempt per generation of lag).
-            attempt += 1
-            decision = decide_rebase(changeset, self._conflict_policy, attempt, self._max_attempts)
-            if isinstance(decision, Abort):
-                raise ConflictAbortError(decision.reason)
-            _backoff(attempt)
-            GenerationCache.discard(work)
-            base, work = self._replay_onto_head(changeset)
+                GenerationCache.discard(phase.work)
+                base, work = self._replay_onto_head(changeset)
+                return _Attempt(base=base, work=work, attempt=attempt)
 
     def _create_marker_resolving(
         self, doc: RootDoc, doc_uuid: UUID, base_attempt: int
@@ -330,16 +383,18 @@ class Lake:
                 outcome = resolve_marker(self._store, target, doc_uuid)
             else:
                 return MarkerOutcome.WON
-            if outcome is not MarkerOutcome.ABSENT:
-                return outcome  # WON (our write echoed back / landed) or LOST
-            # ABSENT: our create genuinely didn't land — retry the SAME doc.
-            local_attempt += 1
-            if base_attempt + local_attempt >= self._max_attempts:
-                raise ExternalServiceError(
-                    f"marker create for generation {target} kept failing "
-                    f"across {self._max_attempts} attempts"
-                )
-            _backoff(base_attempt + local_attempt)
+            match outcome:
+                case MarkerOutcome.WON | MarkerOutcome.LOST:
+                    return outcome  # WON (our write echoed back / landed) or LOST
+                case MarkerOutcome.ABSENT:
+                    # Our create genuinely didn't land — retry the SAME doc.
+                    local_attempt += 1
+                    if base_attempt + local_attempt >= self._max_attempts:
+                        raise ExternalServiceError(
+                            f"marker create for generation {target} kept failing "
+                            f"across {self._max_attempts} attempts"
+                        )
+                    _backoff(base_attempt + local_attempt)
 
     def _try_create_marker(
         self, new_doc: RootDoc, new_uuid: UUID, attempt: int
@@ -349,12 +404,16 @@ class Lake:
         None means the generation was lost (a rival won it) — the caller
         rebases onto the resolved head and tries the next generation.
         """
-        if self._create_marker_resolving(new_doc, new_uuid, attempt) is MarkerOutcome.WON:
-            write_hint(self._store, new_doc.generation)
-            return CommitResult(
-                generation=new_doc.generation, catalog_uuid=new_uuid, attempts=attempt + 1
-            )
-        return None
+        match self._create_marker_resolving(new_doc, new_uuid, attempt):
+            case MarkerOutcome.WON:
+                write_hint(self._store, new_doc.generation)
+                return CommitResult(
+                    generation=new_doc.generation, catalog_uuid=new_uuid, attempts=attempt + 1
+                )
+            case MarkerOutcome.LOST:
+                return None
+            case MarkerOutcome.ABSENT:  # invariant: _create_marker_resolving never returns ABSENT
+                raise AssertionError("_create_marker_resolving returned ABSENT")
 
     def _replay_onto_head(self, changeset: Changeset) -> tuple[RootDoc, Path]:
         """Resolve head, fetch its catalog, and re-execute the changeset onto it.

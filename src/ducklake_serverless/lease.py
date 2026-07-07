@@ -24,6 +24,7 @@ import contextlib
 import json
 import time
 import uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from ducklake_serverless.errors import (
@@ -31,11 +32,45 @@ from ducklake_serverless.errors import (
     ObjectNotFoundError,
     PreconditionFailedError,
 )
+from ducklake_serverless.models import (
+    LeaseAcquirable,
+    LeaseHeldByOther,
+    LeaseState,
+    LeaseVacant,
+)
 
 if TYPE_CHECKING:
     from ducklake_serverless.objectstore import ObjectStore
 
 LEASE_KEY = "maintenance-lease"
+
+
+@dataclass(frozen=True)
+class Observed:
+    """One read of the lease object: who holds it, seconds left, and its etag.
+
+    `seconds_left` is computed against the STORE's clock (see module docstring);
+    <= 0 means expired. A corrupt body reads as expired-and-unowned.
+    """
+
+    holder: str
+    seconds_left: float
+    etag: str
+
+
+def classify_lease(observed: Observed | None, holder_id: str) -> LeaseState:
+    """Pure decision: what can `holder_id` do with the observed lease?
+
+    Vacant (no object) and Acquirable (expired, ours, or corrupt) are both
+    takeable; only a live lease held by someone else refuses acquisition.
+    No I/O — the clock work happens in `_observe`, so this is exhaustively
+    unit-testable.
+    """
+    if observed is None:
+        return LeaseVacant()
+    if observed.holder != holder_id and observed.seconds_left > 0:
+        return LeaseHeldByOther(seconds_left=observed.seconds_left)
+    return LeaseAcquirable(etag=observed.etag)
 
 
 class Lease:
@@ -67,23 +102,24 @@ class Lease:
             }
         ).encode()
 
-    def _remaining(self) -> tuple[float, str] | None:
-        """Seconds left on the current lease and its etag, or None if absent.
+    def _observe(self) -> Observed | None:
+        """Read the lease once: holder, seconds left, and etag; None if absent.
 
         Both timestamps come from the store: the lease object's
         last_modified, and 'now' as the last_modified of a probe object we
         just wrote. When the backend reports no timestamps, fall back to
         local time for 'now' only (single-clock comparison degrades to the
-        old holder-clock behavior, never to something worse).
+        old holder-clock behavior, never to something worse). One GET —
+        the holder rides along, so callers never re-read to learn it.
         """
         try:
             current = self._store.get(self._key)
         except ObjectNotFoundError:
             return None
-        _, ttl, expires_at = _parse(current.body)
+        holder, ttl, expires_at = _parse(current.body)
         if current.last_modified is None:
             # Timestampless backend: degrade to the holder-clock expiry.
-            return (expires_at - time.time(), current.etag)
+            return Observed(holder, expires_at - time.time(), current.etag)
         probe_key = f"{self._key}.now-probe-{uuid.uuid4()}"
         self._store.put_if_absent(probe_key, b"t")
         try:
@@ -91,9 +127,9 @@ class Lease:
         finally:
             self._store.delete(probe_key)
         if now_dt is None:  # store gave a timestamp once but not twice — degrade likewise
-            return (expires_at - time.time(), current.etag)
+            return Observed(holder, expires_at - time.time(), current.etag)
         elapsed = (now_dt - current.last_modified).total_seconds()
-        return (ttl - elapsed, current.etag)
+        return Observed(holder, ttl - elapsed, current.etag)
 
     def acquire(self) -> bool:
         """Try to take the lease. True iff we now hold it.
@@ -109,21 +145,17 @@ class Lease:
         else:
             return True
 
-        remaining = self._remaining()
-        if remaining is None:
-            return self.acquire()  # holder released between our calls
-        seconds_left, etag = remaining
-        try:
-            holder, _, _ = _parse(self._store.get(self._key).body)
-        except ObjectNotFoundError:
-            return self.acquire()
-        if holder != self._holder and seconds_left > 0:
-            return False
-        try:
-            self._etag = self._store.put_if_match(self._key, self._body(), etag)
-        except (PreconditionFailedError, ConditionalConflictError, ObjectNotFoundError):
-            return False  # lost the takeover race
-        return True
+        match classify_lease(self._observe(), self._holder):
+            case LeaseVacant():
+                return self.acquire()  # holder released between our calls
+            case LeaseHeldByOther():
+                return False
+            case LeaseAcquirable() as state:
+                try:
+                    self._etag = self._store.put_if_match(self._key, self._body(), state.etag)
+                except (PreconditionFailedError, ConditionalConflictError, ObjectNotFoundError):
+                    return False  # lost the takeover race
+                return True
 
     def renew(self) -> bool:
         """Extend the lease (rewrites it, resetting last_modified). True iff held."""

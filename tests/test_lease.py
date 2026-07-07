@@ -6,7 +6,8 @@ import json
 import time
 from unittest import mock
 
-from ducklake_serverless.lease import LEASE_KEY, Lease
+from ducklake_serverless.lease import LEASE_KEY, Lease, Observed, classify_lease
+from ducklake_serverless.models import LeaseAcquirable, LeaseHeldByOther, LeaseVacant
 from ducklake_serverless.objectstore import InMemoryObjectStore
 
 
@@ -109,3 +110,35 @@ def test_expiry_uses_store_clock_not_holder_clock() -> None:
     # Store-clock arithmetic sees the lease as expired despite the huge
     # holder-clock expires_at; takeover must succeed.
     assert Lease(store, "honest", ttl_seconds=60).acquire()
+
+
+# --- pure classify_lease: the acquisition decision, no I/O ---
+
+
+def test_classify_vacant_when_absent() -> None:
+    assert isinstance(classify_lease(None, "a"), LeaseVacant)
+
+
+def test_classify_other_holder_live_is_held() -> None:
+    state = classify_lease(Observed(holder="b", seconds_left=30.0, etag="e1"), "a")
+    assert isinstance(state, LeaseHeldByOther)
+    assert state.seconds_left == 30.0
+
+
+def test_classify_other_holder_expired_is_acquirable() -> None:
+    state = classify_lease(Observed(holder="b", seconds_left=-1.0, etag="e1"), "a")
+    assert isinstance(state, LeaseAcquirable)
+    assert state.etag == "e1"
+
+
+def test_classify_own_lease_acquirable_regardless_of_expiry() -> None:
+    live = classify_lease(Observed(holder="a", seconds_left=30.0, etag="e1"), "a")
+    expired = classify_lease(Observed(holder="a", seconds_left=-5.0, etag="e2"), "a")
+    assert isinstance(live, LeaseAcquirable) and live.etag == "e1"
+    assert isinstance(expired, LeaseAcquirable) and expired.etag == "e2"
+
+
+def test_classify_corrupt_reads_as_acquirable() -> None:
+    # A corrupt body parses to holder "<corrupt>", ttl/expiry 0 -> seconds_left <= 0.
+    state = classify_lease(Observed(holder="<corrupt>", seconds_left=0.0, etag="e1"), "a")
+    assert isinstance(state, LeaseAcquirable)

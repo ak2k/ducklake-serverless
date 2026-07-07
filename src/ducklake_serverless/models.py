@@ -225,6 +225,39 @@ class Abort(BaseModel):
 RebaseDecision = Replay | Abort
 
 
+class LeaseVacant(BaseModel):
+    """No lease object exists — acquire by create-only PUT."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["vacant"] = "vacant"
+
+
+class LeaseAcquirable(BaseModel):
+    """A lease object exists but is takeable (expired, ours, or corrupt).
+
+    Acquire by an If-Match overwrite against `etag` — atomic takeover, never
+    delete-then-create.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["acquirable"] = "acquirable"
+    etag: str
+
+
+class LeaseHeldByOther(BaseModel):
+    """A different holder's lease is still live — not acquirable."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["held_by_other"] = "held_by_other"
+    seconds_left: float
+
+
+LeaseState = LeaseVacant | LeaseAcquirable | LeaseHeldByOther
+
+
 class CommitResult(BaseModel):
     """Outcome of a successful commit."""
 
