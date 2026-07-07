@@ -11,10 +11,13 @@ from hypothesis import strategies as st
 
 from ducklake_serverless.errors import InputValidationError
 from ducklake_serverless.models import (
+    HintDoc,
     RootDoc,
     WriterInfo,
     format_catalog_key,
+    format_marker_key,
     parse_catalog_key,
+    parse_marker_key,
 )
 
 
@@ -70,3 +73,37 @@ def test_root_doc_json_round_trip(gen: int, u: UUID) -> None:
     restored = RootDoc.from_json_bytes(doc.to_json_bytes())
     assert restored == doc
     assert restored.catalog_key == doc.catalog_key
+
+
+@given(gen=st.integers(min_value=0, max_value=10**8 - 1))
+def test_marker_key_round_trip(gen: int) -> None:
+    assert parse_marker_key(format_marker_key(gen)) == gen
+
+
+@pytest.mark.parametrize(
+    "bad_key",
+    ["", "roots/1", "roots/00000001/extra", "catalog/00000001", "roots/abcdefgh"],
+)
+def test_non_canonical_marker_keys_rejected(bad_key: str) -> None:
+    with pytest.raises(InputValidationError):
+        parse_marker_key(bad_key)
+
+
+@given(gen=st.integers(max_value=-1))
+def test_negative_marker_generation_rejected(gen: int) -> None:
+    with pytest.raises(InputValidationError):
+        format_marker_key(gen)
+
+
+def test_root_doc_marker_key_matches_generation() -> None:
+    doc = make_root(generation=42)
+    assert doc.marker_key == format_marker_key(42)
+    assert doc.marker_key == "roots/00000042"
+
+
+def test_hint_doc_round_trip() -> None:
+    doc = HintDoc(generation=7)
+    restored = HintDoc.from_json_bytes(doc.to_json_bytes())
+    assert restored == doc
+    assert restored.generation == 7
+    assert b"hint/1" in doc.to_json_bytes()

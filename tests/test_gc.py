@@ -10,9 +10,9 @@ from ducklake_serverless.engine import LakeConnection
 from ducklake_serverless.errors import ExternalServiceError
 from ducklake_serverless.gc import collect
 from ducklake_serverless.lease import Lease
-from ducklake_serverless.models import parse_catalog_key
+from ducklake_serverless.models import HintDoc, parse_catalog_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
-from ducklake_serverless.root import publish_root, read_root
+from ducklake_serverless.root import ROOT_HINT_KEY, resolve_head
 from ducklake_serverless.session import Lake
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ def test_current_generation_never_swept(lake: Lake, store: InMemoryObjectStore) 
     setup_lake_with_history(lake, commits=3)
     report = collect(store, "gc-test", retain_generations=1, dry_run=False)
     assert report is not None
-    current, _ = read_root(store)
+    current, _ = resolve_head(store)
     assert store.list_prefix("catalog/") == [current.catalog_key]
 
 
@@ -77,7 +77,7 @@ def test_lost_cas_orphans_outside_window_are_swept(
 ) -> None:
     setup_lake_with_history(lake, commits=8)
     # Plant an orphan: a catalog uploaded by a loser whose CAS never landed.
-    current, _ = read_root(store)
+    current, _ = resolve_head(store)
     orphan_key = "catalog/cat-00000002-99999999-9999-4999-8999-999999999999.duckdb"
     store.put_if_absent(orphan_key, store.get(current.catalog_key).body)
 
@@ -108,7 +108,7 @@ def test_reader_pinned_inside_window_survives_gc(
 ) -> None:
     """The P3 gate: a reader on an old-but-retained generation still works."""
     setup_lake_with_history(lake, commits=5)  # generations 0..6
-    pinned, _ = read_root(store)  # pin generation 6 (current)
+    pinned, _ = resolve_head(store)  # pin generation 6 (current)
     commit_n(lake, 2)  # advance to 8; pinned is now 2 behind
 
     report = collect(store, "gc-test", retain_generations=3, dry_run=False)
@@ -132,25 +132,47 @@ def test_sweep_refuses_when_root_names_missing_catalog(
     root) cannot be trusted — non-dry-run must refuse, not sweep.
     """
     setup_lake_with_history(lake, commits=3)
-    current, _ = read_root(store)
+    current, _ = resolve_head(store)
     store.delete(current.catalog_key)  # simulate corruption/partial listing
 
     with pytest.raises(ExternalServiceError, match="refusing to sweep"):
         collect(store, "gc-test", retain_generations=1, dry_run=False)
 
 
-def test_sweep_refuses_absurd_root_generation(lake: Lake, store: InMemoryObjectStore) -> None:
-    """A corrupt root with a generation beyond every listed catalog must
+def test_absurd_hint_does_not_cause_a_wrong_sweep(lake: Lake, store: InMemoryObjectStore) -> None:
+    """A poison-high hint names no marker; resolve_head rediscovers the true
 
-    degrade to keep-everything, never amplify into mass deletion.
+    head, so GC sweeps against reality — never against a fabricated head.
     """
-    setup_lake_with_history(lake, commits=3)
-    doc, etag = read_root(store)
-    absurd = doc.model_copy(update={"generation": doc.generation + 1000})
-    # Publish the absurd root; its catalog_key names nothing in the listing.
-    publish_root(store, absurd, etag)
+    setup_lake_with_history(lake, commits=8)  # generations 0..9
+    store.put(ROOT_HINT_KEY, HintDoc(generation=9999).to_json_bytes())
+    report = collect(store, "gc-test", retain_generations=3, dry_run=False)
+    assert report is not None
+    remaining = sorted(parse_catalog_key(k)[0] for k in store.list_prefix("catalog/"))
+    assert remaining == [7, 8, 9]  # correct window despite the poison hint
 
-    before = set(store.list_prefix("catalog/"))
-    with pytest.raises(ExternalServiceError, match="refusing to sweep"):
-        collect(store, "gc-test", retain_generations=1, dry_run=False)
-    assert set(store.list_prefix("catalog/")) == before  # nothing deleted
+
+def test_gc_never_sweeps_markers(lake: Lake, store: InMemoryObjectStore) -> None:
+    """Markers are immortal — GC touches catalog/ only, never roots/."""
+    setup_lake_with_history(lake, commits=8)
+    markers_before = set(store.list_prefix("roots/"))
+    collect(store, "gc-test", retain_generations=1, dry_run=False)
+    assert set(store.list_prefix("roots/")) == markers_before  # all 10 markers survive
+    # And every generation 0..9 is still resolvable/attachable via its marker.
+    for gen in range(10):
+        assert f"roots/{gen:08d}" in markers_before
+
+
+def test_stale_hint_reader_recovers_after_catalog_sweep(
+    lake: Lake, store: InMemoryObjectStore
+) -> None:
+    """A reader whose hint lags below the retention floor still resolves head:
+
+    GC advanced the hint, and forward-probe over immortal markers finds it.
+    """
+    setup_lake_with_history(lake, commits=8)  # 0..9
+    collect(store, "gc-test", retain_generations=3, dry_run=False)  # sweeps catalogs 0..6
+    # Simulate a reader arriving with a hint pointing at a swept generation.
+    store.put(ROOT_HINT_KEY, HintDoc(generation=2).to_json_bytes())
+    with lake.reader() as con:
+        assert con.execute("SELECT count(*) FROM t") == [(8,)]  # head data, recovered

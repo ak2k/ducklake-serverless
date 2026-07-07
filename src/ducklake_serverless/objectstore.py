@@ -25,6 +25,8 @@ from ducklake_serverless.errors import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from mypy_boto3_s3.client import S3Client
 
 
@@ -76,6 +78,10 @@ class ObjectStore(Protocol):
 
     def put_if_match(self, key: str, body: bytes, etag: str) -> str:
         """Conditional overwrite: new ETag, or PreconditionFailedError on stale ETag."""
+        ...
+
+    def put(self, key: str, body: bytes) -> str:
+        """Unconditional PUT (last-writer-wins): new ETag. For advisory objects only."""
         ...
 
     def list_prefix(self, prefix: str) -> list[str]:
@@ -150,6 +156,20 @@ class S3ObjectStore:
             raise ExternalServiceError(f"put_if_match {key!r}") from exc
         except botocore.exceptions.BotoCoreError as exc:
             raise AmbiguousCasError(f"put_if_match {key!r}: outcome unknown") from exc
+        return resp["ETag"].strip('"')
+
+    def put(self, key: str, body: bytes) -> str:
+        """Unconditional PUT — advisory objects (the hint) only.
+
+        No conditional header, so no ambiguity to resolve: on a transport
+        failure the caller simply moves on (the hint is best-effort).
+        """
+        try:
+            resp = self._client.put_object(Bucket=self._bucket, Key=self._full(key), Body=body)
+        except botocore.exceptions.ClientError as exc:
+            raise ExternalServiceError(f"put {key!r}") from exc
+        except botocore.exceptions.BotoCoreError as exc:
+            raise ExternalServiceError(f"put {key!r}: transport failure") from exc
         return resp["ETag"].strip('"')
 
     def list_prefix(self, prefix: str) -> list[str]:
@@ -227,6 +247,129 @@ def verify_conditional_writes(store: ObjectStore, probe_key: str = "cas-probe") 
         store.delete(probe_key)
 
 
+@dataclass(frozen=True)
+class Capabilities:
+    """Which conditional-write primitives a store enforces ATOMICALLY.
+
+    Sequential enforcement is necessary but not sufficient: iDrive E2, for
+    example, enforces If-Match sequentially AND under concurrency, but
+    enforces If-None-Match only sequentially — concurrent create-only PUTs
+    all "win" (last-writer-wins), silently losing commits. Only atomic-
+    under-concurrency primitives are safe to serialize a lake on.
+    """
+
+    atomic_create: bool  # If-None-Match: * exclusive under concurrent PUTs
+    atomic_cas: bool  # If-Match: <etag> exclusive under concurrent PUTs
+
+    @property
+    def can_host_lake(self) -> bool:
+        """Whether a marker-protocol lake can serialize commits on this store.
+
+        The commit path serializes on create-only (`If-None-Match: *`), so
+        atomic create is what a lake needs — a CAS-only backend cannot host it.
+        `atomic_cas` is measured as a seam for a possible future CAS-based
+        fallback but is not load-bearing today.
+        """
+        return self.atomic_create
+
+
+def _count_concurrent_winners(racers: int, attempt: Callable[[int], object]) -> int:
+    """Fire `racers` barrier-synced `attempt(writer_id)` calls; count winners.
+
+    `attempt` must raise PreconditionFailedError/ConditionalConflictError when
+    it definitively LOST the race, and return normally when it won. Any other
+    exception — including AmbiguousCasError, whose landing is unknown — makes
+    the whole measurement untrustworthy and is re-raised after all threads
+    join: a safety gate must fail loud, never certify atomicity from a winner
+    count distorted by a swallowed error.
+    """
+    barrier = threading.Barrier(racers)
+    wins: list[int] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+
+    def run(writer_id: int) -> None:
+        barrier.wait()  # release all at once to maximize contention
+        try:
+            attempt(writer_id)
+        except (PreconditionFailedError, ConditionalConflictError):
+            return  # definitively lost — not a winner
+        except Exception as exc:  # noqa: BLE001  # AmbiguousCas/transport/etc — surfaced below
+            with lock:
+                errors.append(exc)
+            return
+        with lock:
+            wins.append(writer_id)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(racers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if errors:
+        raise ExternalServiceError(
+            f"capability probe indeterminate: {len(errors)} of {racers} contenders "
+            f"failed with an ambiguous or unexpected error ({errors[0]!r})"
+        )
+    return len(wins)
+
+
+def _count_concurrent_create_winners(store: ObjectStore, key: str, racers: int) -> int:
+    """How many of `racers` simultaneous create-only PUTs to `key` succeed."""
+    return _count_concurrent_winners(
+        racers, lambda writer_id: store.put_if_absent(key, f"w{writer_id}".encode())
+    )
+
+
+def _count_concurrent_cas_winners(store: ObjectStore, key: str, racers: int) -> int:
+    """How many of `racers` simultaneous If-Match PUTs (same base etag) succeed."""
+    etag = store.put_if_absent(key, b"seed")
+    return _count_concurrent_winners(
+        racers, lambda writer_id: store.put_if_match(key, f"w{writer_id}".encode(), etag)
+    )
+
+
+def probe_atomic_create(store: ObjectStore, *, racers: int = 6, prefix: str = "cap-probe") -> bool:
+    """Whether create-only (`If-None-Match: *`) is atomic under concurrency.
+
+    This is the single primitive a marker-protocol lake needs, so bootstrap
+    gates on it directly. Cheaper than `probe_capabilities`: one contention
+    round (no CAS seed + race), reserving the full probe for the diagnostic.
+    """
+    import uuid  # noqa: PLC0415  # only needed for a unique probe key
+
+    create_key = f"{prefix}/create-{uuid.uuid4()}"
+    try:
+        return _count_concurrent_create_winners(store, create_key, racers) == 1
+    finally:
+        store.delete(create_key)
+
+
+def probe_capabilities(
+    store: ObjectStore, *, racers: int = 6, prefix: str = "cap-probe"
+) -> Capabilities:
+    """Measure which primitives the store enforces atomically UNDER CONCURRENCY.
+
+    Runs `racers` barrier-synchronized contenders against a single key for
+    each primitive; exactly one winner means atomic, more than one means the
+    store serializes that primitive as last-writer-wins (unsafe). Self-
+    cleaning. This is what `verify_conditional_writes` should have checked —
+    the sequential probe misses stores whose enforcement collapses under
+    real concurrency (iDrive E2's If-None-Match).
+    """
+    import uuid  # noqa: PLC0415  # only needed for unique probe keys
+
+    create_key = f"{prefix}/create-{uuid.uuid4()}"
+    cas_key = f"{prefix}/cas-{uuid.uuid4()}"
+    try:
+        atomic_create = _count_concurrent_create_winners(store, create_key, racers) == 1
+        atomic_cas = _count_concurrent_cas_winners(store, cas_key, racers) == 1
+    finally:
+        store.delete(create_key)
+        store.delete(cas_key)
+    return Capabilities(atomic_create=atomic_create, atomic_cas=atomic_cas)
+
+
 class InMemoryObjectStore:
     """Deterministic fake for unit and stateful property tests.
 
@@ -274,6 +417,13 @@ class InMemoryObjectStore:
             new_etag = self._next_etag()
             self._objects[key] = (body, new_etag, datetime.now(tz=UTC))
             return new_etag
+
+    def put(self, key: str, body: bytes) -> str:
+        """Unconditional overwrite (last-writer-wins)."""
+        with self._lock:
+            etag = self._next_etag()
+            self._objects[key] = (body, etag, datetime.now(tz=UTC))
+            return etag
 
     def list_prefix(self, prefix: str) -> list[str]:
         """List keys under a prefix, sorted for determinism."""

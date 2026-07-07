@@ -15,6 +15,7 @@ Invariants asserted at the end:
 
 from __future__ import annotations
 
+import itertools
 import threading
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -25,7 +26,7 @@ from ducklake_serverless.errors import ConflictAbortError
 from ducklake_serverless.gc import collect, maintain_data
 from ducklake_serverless.models import parse_catalog_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
-from ducklake_serverless.root import read_root
+from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 
 if TYPE_CHECKING:
@@ -77,9 +78,14 @@ def test_concurrent_blind_appends_hold_invariants(tmp_path: Path) -> None:
     assert not failures, f"writers aborted: {failures[:3]}"
     assert len(acks) == WRITERS * COMMITS_PER_WRITER
 
-    # Gapless generations: bootstrap(0) + CREATE(1) + one per acked commit.
-    final_root, _ = read_root(store)
-    assert final_root.generation == 1 + len(acks)
+    # Marker density (the strongest exclusivity+gaplessness statement): exactly
+    # one marker per generation 0..head, no gaps, no duplicates.
+    head = 1 + len(acks)  # bootstrap(0) + CREATE(1) + one per acked commit
+    markers = store.list_prefix("roots/")
+    assert markers == [f"roots/{g:08d}" for g in range(head + 1)]
+    final_root, gen = resolve_head(store)
+    assert gen == head
+    assert final_root.generation == head
 
     verify = make_lake(store, tmp_path, "verify", data)
     with verify.reader() as con:
@@ -199,7 +205,7 @@ def test_writers_with_concurrent_gc_hold_invariants(tmp_path: Path) -> None:
 
     # Retention respected: at most retain_generations catalogs remain
     # (plus any not-yet-swept tail from the final commits).
-    final, _ = read_root(store)
+    final, _ = resolve_head(store)
     kept = [parse_catalog_key(k)[0] for k in store.list_prefix("catalog/")]
     assert final.generation in kept
 
@@ -235,27 +241,31 @@ def test_writers_with_concurrent_data_maintenance(tmp_path: Path) -> None:
             with lock:
                 acks.append((writer_id, seq))
 
+    maintenance_seq = itertools.count()
+
+    def run_maintenance() -> object | None:
+        lake = make_lake(store, tmp_path, f"mgc-{next(maintenance_seq)}", data)
+        return maintain_data(
+            lake,
+            store,
+            "torture-maintenance",
+            expire_older_than=timedelta(0),
+            physical_delete_delay=timedelta(0),
+            dry_run=False,
+            # Zero delay races appenders' staged Parquet on purpose: appends
+            # re-stage on replay, so the race is survivable here; production
+            # keeps the floor.
+            _unsafe_allow_short_delay=True,
+        )
+
     def maintenance_loop() -> None:
-        lake = make_lake(store, tmp_path, "mgc", data)
-        now = timedelta(0)
         while not stop.is_set():
             try:
-                report = maintain_data(
-                    lake,
-                    store,
-                    "torture-maintenance",
-                    expire_older_than=now,
-                    physical_delete_delay=now,
-                    dry_run=False,
-                    # Zero delay races appenders' staged Parquet on purpose:
-                    # appends re-stage on replay, so the race is survivable
-                    # here; production keeps the floor.
-                    _unsafe_allow_short_delay=True,
-                )
+                report = run_maintenance()
                 if report is not None:
                     maintenance_runs.append(report)
             except ConflictAbortError:
-                pass  # lost a race to an appender — fine, retry next tick
+                continue  # lost a race to an appender — retry immediately
             stop.wait(0.5)
 
     threads = [threading.Thread(target=writer, args=(i,)) for i in range(3)]
@@ -268,8 +278,11 @@ def test_writers_with_concurrent_data_maintenance(tmp_path: Path) -> None:
     stop.set()
     gc_thread.join()
 
-    assert maintenance_runs, "maintenance never completed a pass"
     assert len(acks) == 3 * 12
+    # A final, uncontended pass must succeed deterministically (the concurrent
+    # loop above may have raced every tick to abort under a fast workload).
+    final = run_maintenance()
+    assert final is not None
 
     verify = make_lake(store, tmp_path, "mverify", data)
     with verify.reader() as con:

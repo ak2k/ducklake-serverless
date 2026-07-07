@@ -3,10 +3,11 @@
 A `Lake` wraps an `ObjectStore` and a local working directory. Writers use
 `lake.transaction()` — SQL runs against a local copy of the current
 catalog generation via the stock ducklake extension, is recorded as a
-logical changeset, then committed by publishing the new generation and
-CASing the root. On a lost race, `decide_rebase` chooses between replaying
-the changeset onto the winner's generation and aborting to the caller.
-Readers use `lake.reader()` — the frozen-DuckLake pattern.
+logical changeset, then committed by creating the next immutable
+generation marker (`roots/<gen>`). On a lost race, `decide_rebase` chooses
+between replaying the changeset onto the winner's generation and aborting.
+An ambiguous marker create resolves by GETting the marker — exact and
+permanent (see root.py). Readers use `lake.reader()`.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from ducklake_serverless.engine import (
 )
 from ducklake_serverless.errors import (
     AmbiguousCasError,
+    BackendUnsafeError,
     ConditionalConflictError,
     ConflictAbortError,
     ExternalServiceError,
@@ -47,14 +49,16 @@ from ducklake_serverless.models import (
     WriterInfo,
     format_catalog_key,
 )
+from ducklake_serverless.objectstore import probe_atomic_create, probe_capabilities
 from ducklake_serverless.rebase import decide_rebase
 from ducklake_serverless.recorder import record
 from ducklake_serverless.root import (
-    CasOutcome,
-    bootstrap_root,
-    publish_root,
-    read_root,
-    resolve_cas,
+    MarkerOutcome,
+    create_marker,
+    read_marker,
+    resolve_head,
+    resolve_marker,
+    write_hint,
 )
 
 if TYPE_CHECKING:
@@ -129,11 +133,39 @@ class Lake:
         self._max_attempts = max_attempts
         self._s3_credentials = s3_credentials
 
-    def bootstrap(self) -> RootDoc:
-        """Create generation 0 (an empty DuckLake catalog) and the root.
+    def _require_atomic_create(self) -> None:
+        """Refuse a backend whose create-only isn't atomic under concurrency."""
+        if not probe_atomic_create(self._store):
+            # Re-probe the full set only to enrich the refusal diagnostic; the
+            # happy path above pays for a single contention round, not two.
+            caps = probe_capabilities(self._store)
+            raise BackendUnsafeError(
+                "backend does not enforce If-None-Match: * atomically under "
+                "concurrency (concurrent create-only PUTs all 'win', silently "
+                "losing commits) — it cannot serialize a marker-protocol lake. "
+                f"Probed capabilities: {caps}. Use an atomic backend (MinIO, "
+                "AWS S3, SeaweedFS) for concurrent writers, or "
+                "bootstrap(verify_backend=False) for a single-writer lake."
+            )
 
-        Create-only end to end: loses cleanly to any concurrent bootstrap.
+    def bootstrap(self, *, verify_backend: bool = True) -> RootDoc:
+        """Create generation 0 (an empty DuckLake catalog) and its marker.
+
+        Create-only end to end: loses cleanly to any concurrent bootstrap,
+        and an ambiguous marker create resolves by GET (same as any commit).
+
+        By default this probes the backend for ATOMIC create-only enforcement
+        under concurrency and refuses to create a lake on a store that lacks
+        it — the marker protocol serializes commits on `If-None-Match: *`, so
+        a store that resolves concurrent creates last-writer-wins (iDrive E2,
+        garage, rclone serve s3) would silently lose commits. Pass
+        `verify_backend=False` only for a single-writer lake where no
+        concurrent create can occur. (See `probe_capabilities`; a v1 root-CAS
+        strategy could serve atomic-CAS-only backends, but no tested backend
+        needs it — E2 enforces neither primitive atomically.)
         """
+        if verify_backend:
+            self._require_atomic_create()
         catalog_uuid = uuid4()
         catalog_path = self._workdir / f"bootstrap-{catalog_uuid}.duckdb"
         connection = LakeConnection(
@@ -151,9 +183,15 @@ class Lake:
                 created_at=datetime.now(tz=UTC),
                 writer=_writer_info(),
             )
-            bootstrap_root(self._store, doc)
+            if self._create_marker_resolving(doc, catalog_uuid, 0) is MarkerOutcome.LOST:
+                # A concurrent bootstrap won generation 0; adopt its (equally
+                # empty) lake. Our orphan catalog is swept by GC later. (WON
+                # falls through; ABSENT is retried inside the helper, so
+                # read_marker(0) below never races a not-yet-created marker.)
+                return read_marker(self._store, 0)
         finally:
             GenerationCache.discard(catalog_path)
+        write_hint(self._store, 0)
         return doc
 
     @contextmanager
@@ -181,13 +219,13 @@ class Lake:
         the whole call raises ConflictAbortError. VersionMismatchError if
         local versions differ from the lake's pins.
         """
-        base, etag, work = self._fetch_current_base()
+        base, work = self._fetch_current_base()
         with self._writable_copy(work) as connection:
             transaction = Transaction(connection)
             yield transaction
 
         try:
-            self._commit(work, base, etag, transaction.changeset)
+            self._commit(work, base, transaction.changeset)
         finally:
             GenerationCache.discard(work)
 
@@ -229,107 +267,124 @@ class Lake:
                 return False
         return True
 
-    def _commit(self, work: Path, base: RootDoc, etag: str, changeset: Changeset) -> CommitResult:
-        """Publish + CAS, replaying onto newer generations until won or aborted."""
+    def _commit(self, work: Path, base: RootDoc, changeset: Changeset) -> CommitResult:
+        """Create the next generation marker, rebasing onto the head until won.
+
+        A marker create is create-only, so both a 412 (someone won this
+        generation) and an ambiguous outcome resolve by GETting the marker:
+        our uuid means WON (permanent — the marker is immutable and immortal),
+        anyone else's means LOST, absent means our create never landed.
+        """
         attempt = 0
         while True:
+            target = base.generation + 1
             new_uuid = uuid4()
             self._check_format_unmigrated(work, base)
-            if not self._publish_generation_resolved(work, base.generation + 1, new_uuid, attempt):
+            if not self._publish_generation_resolved(work, target, new_uuid, attempt):
                 attempt += 1
                 _backoff(attempt)
                 continue
             new_doc = base.model_copy(
                 update={
-                    "generation": base.generation + 1,
+                    "generation": target,
                     "catalog_uuid": new_uuid,
                     "created_at": datetime.now(tz=UTC),
                     "writer": _writer_info(),
                 }
             )
+
+            result = self._try_create_marker(new_doc, new_uuid, attempt)
+            if result is not None:
+                return result
+
+            # Lost this generation: honor the conflict policy, then rebase onto
+            # the current HEAD (not just the collided marker — a stale writer
+            # must not burn one attempt per generation of lag).
+            attempt += 1
+            decision = decide_rebase(changeset, self._conflict_policy, attempt, self._max_attempts)
+            if isinstance(decision, Abort):
+                raise ConflictAbortError(decision.reason)
+            _backoff(attempt)
+            GenerationCache.discard(work)
+            base, work = self._replay_onto_head(changeset)
+
+    def _create_marker_resolving(
+        self, doc: RootDoc, doc_uuid: UUID, base_attempt: int
+    ) -> MarkerOutcome:
+        """Create `doc`'s marker, resolving ambiguity by GET; retry on ABSENT.
+
+        A marker create is create-only, so a 412/409 and an ambiguous outcome
+        both resolve by GETting the marker: our uuid means WON (permanent — the
+        marker is immutable and immortal), anyone else's means LOST, absent
+        means our create never landed. ABSENT retries the SAME doc (safe: the
+        key is never deleted, so re-creating is idempotent against a still-in-
+        flight twin), bounded by max_attempts. Returns WON or LOST, never
+        ABSENT — an ABSENT that never resolves raises ExternalServiceError.
+        """
+        target = doc.generation
+        local_attempt = 0
+        while True:
             try:
-                publish_root(self._store, new_doc, etag)
-                return CommitResult(
-                    generation=new_doc.generation,
-                    catalog_uuid=new_uuid,
-                    attempts=attempt + 1,
+                create_marker(self._store, doc)
+            except (PreconditionFailedError, ConditionalConflictError, AmbiguousCasError):
+                outcome = resolve_marker(self._store, target, doc_uuid)
+            else:
+                return MarkerOutcome.WON
+            if outcome is not MarkerOutcome.ABSENT:
+                return outcome  # WON (our write echoed back / landed) or LOST
+            # ABSENT: our create genuinely didn't land — retry the SAME doc.
+            local_attempt += 1
+            if base_attempt + local_attempt >= self._max_attempts:
+                raise ExternalServiceError(
+                    f"marker create for generation {target} kept failing "
+                    f"across {self._max_attempts} attempts"
                 )
-            except (PreconditionFailedError, ConditionalConflictError):
-                # A 412/409 can be our OWN successful write echoed back: an
-                # SDK-level transport retry of a conditional PUT that landed
-                # 412s against itself. Resolve by commit token before
-                # concluding someone else won — otherwise this would replay
-                # an already-committed changeset (double-apply).
-                outcome, current, current_etag = resolve_cas(self._store, new_uuid)
-                if outcome is CasOutcome.WON:
-                    return CommitResult(
-                        generation=current.generation,
-                        catalog_uuid=new_uuid,
-                        attempts=attempt + 1,
-                    )
-                base, etag = current, current_etag
-            except AmbiguousCasError:
-                outcome, current, current_etag = resolve_cas(self._store, new_uuid)
-                if outcome is CasOutcome.WON:
-                    return CommitResult(
-                        generation=current.generation,
-                        catalog_uuid=new_uuid,
-                        attempts=attempt + 1,
-                    )
-                # LOST after an ambiguous outcome is unresolvable: our write
-                # may have landed and been built upon before this re-read —
-                # any successor destroys the uuid evidence. Replaying could
-                # double-apply; the only safe exit is abort.
-                raise ConflictAbortError(
-                    "commit outcome ambiguous and the root has moved on — the "
-                    "write may or may not be committed. Verify lake state "
-                    "before retrying this transaction."
-                ) from None
+            _backoff(base_attempt + local_attempt)
 
-            while True:
-                attempt += 1
-                decision = decide_rebase(
-                    changeset, self._conflict_policy, attempt, self._max_attempts
-                )
-                if isinstance(decision, Abort):
-                    raise ConflictAbortError(decision.reason)
-                _backoff(attempt)
-                try:
-                    replayed = self._replay(base, changeset)
-                except ObjectNotFoundError:
-                    # GC swept the base between our root read and the fetch —
-                    # the root has necessarily advanced; rebase onto current.
-                    base, etag = read_root(self._store)
-                else:
-                    GenerationCache.discard(work)
-                    work = replayed
-                    break
+    def _try_create_marker(
+        self, new_doc: RootDoc, new_uuid: UUID, attempt: int
+    ) -> CommitResult | None:
+        """Attempt the marker create; return a CommitResult on WIN, else None.
 
-    def _replay(self, winner: RootDoc, changeset: Changeset) -> Path:
-        """Re-execute the changeset against a fresh copy of the winner's catalog."""
-        self._check_versions(winner)
-        work = self._cache.fetch_copy(winner.generation, winner.catalog_uuid)
+        None means the generation was lost (a rival won it) — the caller
+        rebases onto the resolved head and tries the next generation.
+        """
+        if self._create_marker_resolving(new_doc, new_uuid, attempt) is MarkerOutcome.WON:
+            write_hint(self._store, new_doc.generation)
+            return CommitResult(
+                generation=new_doc.generation, catalog_uuid=new_uuid, attempts=attempt + 1
+            )
+        return None
+
+    def _replay_onto_head(self, changeset: Changeset) -> tuple[RootDoc, Path]:
+        """Resolve head, fetch its catalog, and re-execute the changeset onto it.
+
+        Returns the head doc and the mutated work copy, ready to publish as
+        head+1. GC-race-safe via `_fetch_current_base`.
+        """
+        head, work = self._fetch_current_base()
         with self._writable_copy(work) as connection:
             for statement in changeset.statements:
                 connection.execute(statement.sql, statement.params)
-        return work
+        return head, work
 
-    def _fetch_current_base(self) -> tuple[RootDoc, str, Path]:
-        """Resolve the current root and fetch its catalog, GC-race-safe.
+    def _fetch_current_base(self) -> tuple[RootDoc, Path]:
+        """Resolve the current head and fetch its catalog, GC-race-safe.
 
-        Between reading the root and fetching its catalog, GC may sweep
-        that generation (the root advanced past retention meanwhile). No
-        user SQL has run yet, so re-reading and retrying is always correct.
+        Between resolving the head and fetching its catalog, GC may sweep
+        that generation. No user SQL has run yet (or, on the rebase path, the
+        replay hasn't started), so re-resolving and retrying is always
+        correct — resolve_head always yields a currently-extant marker.
         """
         for _ in range(self._max_attempts):
-            base, etag = read_root(self._store)
+            base, _ = resolve_head(self._store)
             self._check_versions(base)
             try:
-                return base, etag, self._cache.fetch_copy(base.generation, base.catalog_uuid)
+                return base, self._cache.fetch_copy(base.generation, base.catalog_uuid)
             except ObjectNotFoundError:
                 continue
         raise ExternalServiceError(
-            f"catalog for the current root kept vanishing across "
+            f"catalog for the current head kept vanishing across "
             f"{self._max_attempts} attempts — GC retention is too aggressive "
             "for this commit rate"
         )
@@ -343,7 +398,7 @@ class Lake:
         ``dry_run => true``) still hit the shared bucket immediately — run
         exclusively dry-run/read statements here.
         """
-        _, _, work = self._fetch_current_base()
+        _, work = self._fetch_current_base()
         try:
             connection = LakeConnection(work, self._data_path, s3_credentials=self._s3_credentials)
         except BaseException:
@@ -358,7 +413,7 @@ class Lake:
     @contextmanager
     def reader(self) -> Generator[LakeConnection]:
         """Attach the current generation READ_ONLY (frozen-DuckLake pattern)."""
-        _, _, path = self._fetch_current_base()
+        _, path = self._fetch_current_base()
         try:
             connection = LakeConnection(
                 path, data_path=None, read_only=True, s3_credentials=self._s3_credentials

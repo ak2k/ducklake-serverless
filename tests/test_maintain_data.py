@@ -11,8 +11,9 @@ from ducklake_serverless.engine import LakeConnection
 from ducklake_serverless.errors import ConflictAbortError, InputValidationError
 from ducklake_serverless.gc import maintain_data
 from ducklake_serverless.lease import Lease
+from ducklake_serverless.models import ROOTS_PREFIX
 from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore
-from ducklake_serverless.root import ROOT_KEY, read_root
+from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 from tests.conftest import lake_churn as churn
 
@@ -112,12 +113,12 @@ def test_maintenance_advances_the_root(lake: Lake, store: InMemoryObjectStore, d
     churn(lake)
     with lake.reader() as con:
         snapshots_before = len(con.snapshot_ids())
-    before, _ = read_root(store)
+    before, _ = resolve_head(store)
     report = maintain_data(
         lake, store, "gc", expire_older_than=NOW, physical_delete_delay=NOW, dry_run=False, **UNSAFE
     )
     assert report is not None
-    after, _ = read_root(store)
+    after, _ = resolve_head(store)
     assert after.generation == before.generation + 1
     with lake.reader() as con:
         # Expired snapshots are gone from the published catalog.
@@ -170,12 +171,12 @@ def test_noop_pass_does_not_mint_a_generation(lake: Lake, store: InMemoryObjectS
     window that reader pins depend on.
     """
     churn(lake)
-    before, _ = read_root(store)
+    before, _ = resolve_head(store)
     # Default gates: nothing is old enough to touch -> no-op -> no commit.
     report = maintain_data(lake, store, "gc", dry_run=False)
     assert report is not None
     assert not (report.snapshots_expired or report.files_cleaned or report.orphans_deleted)
-    after, _ = read_root(store)
+    after, _ = resolve_head(store)
     assert after.generation == before.generation
 
 
@@ -188,7 +189,7 @@ def test_pinned_reader_within_contract_survives_maintenance(
     snapshots that generation references — the documented pin contract.
     """
     churn(lake)  # generations 0..4; snapshots referencing live parquet
-    pinned_root, _ = read_root(store)
+    pinned_root, _ = resolve_head(store)
 
     # Advance the lake past the pinned generation.
     with lake.transaction() as tx:
@@ -236,20 +237,26 @@ def test_lost_cas_after_physical_deletes_stays_consistent(
             return self._inner.get(key)
 
         def put_if_absent(self, key: str, body: bytes) -> str:
-            return self._inner.put_if_absent(key, body)
-
-        def put_if_match(self, key: str, body: bytes, etag: str) -> str:
-            if key == ROOT_KEY and self._armed:
+            if key.startswith(ROOTS_PREFIX) and self._armed:
                 self._armed = False
+                # A rival wins THIS generation first, so maintenance's marker
+                # create 412s and (state-dependent CALLs) aborts — after its
+                # physical deletes already landed.
                 rival_work = self._tmp / "rival"
                 rival_work.mkdir(exist_ok=True)
                 rival = Lake(self._inner, workdir=rival_work, data_path=str(data))
                 with rival.transaction() as tx:
                     tx.sql("INSERT INTO t VALUES (999999)")
+            return self._inner.put_if_absent(key, body)
+
+        def put_if_match(self, key: str, body: bytes, etag: str) -> str:
             return self._inner.put_if_match(key, body, etag)
 
         def list_prefix(self, prefix: str) -> list[str]:
             return self._inner.list_prefix(prefix)
+
+        def put(self, key: str, body: bytes) -> str:
+            return self._inner.put(key, body)
 
         def delete(self, key: str) -> None:
             self._inner.delete(key)

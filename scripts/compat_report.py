@@ -14,21 +14,25 @@ MANUAL_ROWS = [
     {
         "backend": "AWS S3",
         "version": "(service)",
-        "verdict": "enforce",
+        "verdict": "atomic",
         "tested_at": "2024-11-25",
         "provenance": "AWS launch announcement + delta-rs production use",
     },
     {
         "backend": "iDrive E2",
         "version": "(service)",
-        "verdict": "enforce",
-        "tested_at": "2026-07-05",
-        "provenance": "manual probe (undocumented by iDrive; verified empirically)",
+        "verdict": "sequential-only",
+        "tested_at": "2026-07-07",
+        "provenance": (
+            "manual probe: enforces sequentially but NOT under concurrency "
+            "(14-15/15 multi-winner) — unsafe for concurrent writers"
+        ),
     },
 ]
 
 VERDICT_LABEL = {
-    "enforce": "✅ enforces",
+    "atomic": "✅ atomic — safe for concurrent writers",
+    "sequential-only": "⚠️ sequential only — UNSAFE under concurrency (silently loses commits)",
     "ignore": "❌ accepts but IGNORES — unsafe, corrupts silently",
     "mixed": "⚠️ partial — unsafe",
     "broken": "⚠️ probe failed",

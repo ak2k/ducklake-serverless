@@ -25,6 +25,7 @@ from ducklake_serverless.errors import (
 from ducklake_serverless.objectstore import (
     InMemoryObjectStore,
     S3ObjectStore,
+    probe_capabilities,
     verify_conditional_writes,
 )
 
@@ -135,3 +136,39 @@ def test_verify_conditional_writes_rejects_ignoring_store() -> None:
 
     with pytest.raises(ExternalServiceError, match="does not enforce"):
         verify_conditional_writes(IgnoresConditionals())
+
+
+def test_put_is_unconditional_last_writer_wins(store: S3ObjectStore) -> None:
+    store.put("hint", b"v1")
+    store.put("hint", b"v2")  # no precondition — overwrites freely
+    assert store.get("hint").body == b"v2"
+
+
+def test_probe_capabilities_reports_atomic_for_conformant_store(store: S3ObjectStore) -> None:
+    caps = probe_capabilities(store, racers=4)
+    assert caps.atomic_create and caps.atomic_cas
+    assert caps.can_host_lake
+    assert not store.list_prefix("cap-probe")  # self-cleaning
+
+
+def test_probe_capabilities_flags_nonatomic_create() -> None:
+    """A store whose create-only is last-writer-wins (E2-shaped) reports
+
+    atomic_create=False — the gap the sequential probe missed.
+    """
+
+    class NonAtomicCreate(InMemoryObjectStore):
+        @override
+        def put_if_absent(self, key: str, body: bytes) -> str:
+            # No exclusivity: every create "wins", overwriting (E2 under load).
+            with self._lock:  # pyright: ignore[reportPrivateUsage]
+                etag = self._next_etag()  # pyright: ignore[reportPrivateUsage]
+                self._objects[key] = (body, etag, datetime.now(tz=UTC))  # pyright: ignore[reportPrivateUsage]
+                return etag
+
+    caps = probe_capabilities(NonAtomicCreate(), racers=4)
+    assert not caps.atomic_create
+    assert caps.atomic_cas  # If-Match still exclusive here
+    # ...but the marker protocol serializes on create-only, so a CAS-only
+    # backend cannot host a lake — can_host_lake tracks atomic_create.
+    assert not caps.can_host_lake

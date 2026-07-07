@@ -34,6 +34,18 @@ class ObjectNotFoundError(NotFoundError):
     """The requested object key does not exist in the store."""
 
 
+class LakeNotInitializedError(NotFoundError):
+    """No generation-0 marker exists — the bucket holds no lake to resolve."""
+
+
+class BackendUnsafeError(AppError):
+    """The object store lacks an atomic conditional-write primitive.
+
+    Its conditional writes pass sequentially but collapse under concurrency
+    (last-writer-wins), so it cannot safely serialize concurrent commits.
+    """
+
+
 class PreconditionFailedError(AppError):
     """Conditional write rejected: the precondition did not hold (HTTP 412).
 

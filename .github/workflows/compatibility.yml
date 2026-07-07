@@ -122,16 +122,16 @@ jobs:
           set +e
           fail=0
           uv run python scripts/compat_probe.py --backend MinIO \
-            --version "$MINIO_VERSION" --expected enforce \
+            --version "$MINIO_VERSION" --expected atomic \
             --endpoint http://127.0.0.1:9001 \
             --access-key probe --secret-key probeprobe \
             --out results/1-minio.json || fail=1
           uv run python scripts/compat_probe.py --backend SeaweedFS \
-            --version "$SEAWEEDFS_VERSION" --expected enforce \
+            --version "$SEAWEEDFS_VERSION" --expected atomic \
             --endpoint http://127.0.0.1:9002 \
             --out results/2-seaweedfs.json || fail=1
           uv run python scripts/compat_probe.py --backend moto \
-            --version moto --expected enforce \
+            --version moto --expected atomic \
             --out results/3-moto.json || fail=1
           uv run python scripts/compat_probe.py --backend "garage" \
             --version "$GARAGE_VERSION" --expected ignore \

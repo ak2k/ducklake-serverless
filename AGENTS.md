@@ -12,26 +12,36 @@ Contract for agents working in this repo. Read first; overrides defaults.
 
 Protocol invariants agents must not weaken (see `docs/` and the plan):
 
-- The root object is the ONLY mutable key. Catalog generations and data files
-  are immutable, uniquely named, uploaded with `If-None-Match: *`.
-- Never retry a conditional PUT on an ambiguous outcome — resolve by re-reading
-  the root and comparing catalog UUIDs (`root.resolve_cas`).
-- `catalog_key` is derived from `(generation, uuid)`, never stored.
+- A commit is the create-only PUT of an immutable per-generation marker
+  `roots/<gen>` (`If-None-Match: *`). Exactly one body ever exists per
+  generation, markers are NEVER deleted (immortal), and they are dense
+  (0..head, no gaps). Catalog generations and data files are likewise
+  immutable and uniquely named.
+- `root-hint` is the ONLY mutable object — an advisory latest-generation
+  number, never a document source. Every RootDoc comes from a marker;
+  the hint is only a probe start position, always GET-verified.
+- Ambiguity resolution is EXACT and PERMANENT: on a 412 or ambiguous marker
+  create, GET the marker — our uuid means WON forever, another's means LOST,
+  absent means retry the SAME doc (`root.resolve_marker`). Never retry a
+  conditional PUT to answer "did it land?".
+- `catalog_key` / `marker_key` are derived from `(generation, uuid)`, never
+  stored.
 - Only blind appends auto-replay on conflict; state-dependent DML aborts unless
-  the caller opted into `replay_all`.
-- Version fields in the root doc gate commits; auto-migration of the catalog
+  the caller opted into `replay_all`. A loser rebases onto the resolved HEAD,
+  not the single collided marker.
+- Version fields in the marker doc gate commits; auto-migration of the catalog
   format is forbidden — BOTH pins are enforced: duckdb_storage_version before
   attach, ducklake_format_version before publish.
-- GC never deletes the current generation or any generation inside the
-  retention window; readers pinned to retained generations keep their
-  catalog ATTACH unconditionally. Their DATA reads are durable for
-  min(catalog retention window, expire_older_than + physical_delete_delay)
-  — plan expire_older_than around the longest reader pin.
+- GC sweeps `catalog/` only — NEVER `roots/`. It never deletes the current
+  generation or any generation inside the retention window; readers pinned to
+  retained generations keep their catalog ATTACH unconditionally. Their DATA
+  reads are durable for min(catalog retention window, expire_older_than +
+  physical_delete_delay) — plan expire_older_than around the longest reader pin.
 - Non-dry-run data maintenance enforces MIN_PHYSICAL_DELAY: the orphan pass
   must never race an in-flight writer's staged-but-uncommitted Parquet.
-- S3 clients MUST disable transport retries (`make_s3_client`) — an SDK-level
-  retry of a conditional PUT can 412 against our own successful write,
-  masking a committed transaction as a lost race.
+- S3 clients SHOULD disable transport retries (`make_s3_client`); with markers
+  the own-write evidence is immortal, so a self-412 from an SDK retry resolves
+  WON — but disabling retries keeps the resolution path simple.
 
 ## Stack (one per concern; substitutes are bans)
 

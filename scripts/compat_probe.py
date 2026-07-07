@@ -14,6 +14,7 @@ import contextlib
 import datetime
 import json
 import sys
+import threading
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -34,8 +35,37 @@ def _status(exc: botocore.exceptions.ClientError) -> int:
     return int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
 
 
+def _concurrent_create_winners(client: S3Client, bucket: str, key: str, racers: int) -> int:
+    """How many of `racers` simultaneous create-only PUTs to `key` succeed.
+
+    The atomicity test the sequential probe misses: iDrive E2 enforces
+    If-None-Match sequentially but lets ALL concurrent creates win.
+    """
+    barrier = threading.Barrier(racers)
+    wins: list[int] = []
+    lock = threading.Lock()
+
+    def contend(writer_id: int) -> None:
+        barrier.wait()
+        try:
+            client.put_object(  # pyright: ignore[reportUnknownMemberType]  # boto3 client methods are untyped
+                Bucket=bucket, Key=key, Body=f"w{writer_id}".encode(), IfNoneMatch="*"
+            )
+        except botocore.exceptions.ClientError:
+            return
+        with lock:
+            wins.append(writer_id)
+
+    threads = [threading.Thread(target=contend, args=(i,)) for i in range(racers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return len(wins)
+
+
 def probe(client: S3Client, bucket: str, key: str) -> dict[str, str]:
-    """Four-probe CAS conformance check. Returns per-probe outcomes."""
+    """Sequential four-probe check plus a concurrent create-only atomicity test."""
     results: dict[str, str] = {}
 
     def put(name: str, **kwargs: object) -> None:
@@ -52,21 +82,31 @@ def probe(client: S3Client, bucket: str, key: str) -> dict[str, str]:
     put("if_match_correct", Body=PROBE_BODY_2, IfMatch=etag)
     put("if_match_stale", Body=PROBE_BODY_2, IfMatch=etag)
     client.delete_object(Bucket=bucket, Key=key)
+
+    winners = _concurrent_create_winners(client, bucket, f"{key}-conc", racers=6)
+    results["concurrent_create_winners"] = str(winners)
+    client.delete_object(Bucket=bucket, Key=f"{key}-conc")
     return results
 
 
 def verdict_of(results: dict[str, str]) -> str:
-    """Classify: enforce = both negative probes 412; ignore = both 200."""
+    """Classify enforcement.
+
+    atomic          = sequential enforce AND exactly one concurrent winner
+    sequential-only = sequential enforce BUT concurrent last-writer-wins
+    ignore          = doesn't enforce even sequentially
+    """
     fresh_ok = results.get("create_only_fresh") == "200"
     match_ok = results.get("if_match_correct") == "200"
     existing = results.get("create_only_existing")
     stale = results.get("if_match_stale")
+    winners = int(results.get("concurrent_create_winners", "0"))
     if not (fresh_ok and match_ok):
         return "broken"
-    if existing == "412" and stale == "412":
-        return "enforce"
     if existing == "200" and stale == "200":
         return "ignore"
+    if existing == "412" and stale == "412":
+        return "atomic" if winners == 1 else "sequential-only"
     return "mixed"
 
 
@@ -104,7 +144,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", required=True)
     parser.add_argument("--version", required=True, help="Version/tag under test")
-    parser.add_argument("--expected", required=True, choices=["enforce", "ignore"])
+    parser.add_argument(
+        "--expected", required=True, choices=["atomic", "ignore", "sequential-only"]
+    )
     parser.add_argument("--endpoint", default=None, help="Omit for moto (in-process)")
     parser.add_argument("--access-key", default="probe")
     parser.add_argument("--secret-key", default="probe")

@@ -19,28 +19,36 @@ a local DuckDB file for single-user. This library removes the server:
 - The **entire catalog is an immutable, versioned DuckDB file** in the bucket
   (`catalog/cat-<generation>-<uuid>.duckdb`) — each generation is a complete,
   stock DuckLake catalog readable by any DuckLake-aware tool.
-- A single tiny **root object** points at the current generation. It is the
-  only mutable key in the lake.
-- Commits are **compare-and-swap**: prepare everything (Parquet data files +
-  the next catalog generation), then publish with one conditional PUT
-  (`If-Match: <etag>`). Exactly one concurrent writer wins; losers rebase and
-  retry.
-- Readers need zero custom code: resolve the root, then
+- Each commit **creates one immutable generation marker** `roots/<generation>`
+  (Delta-log-shaped) — a create-only PUT (`If-None-Match: *`) whose body names
+  that generation's catalog. Exactly one writer wins each generation; the
+  marker is never overwritten and never deleted. A tiny mutable `root-hint`
+  points at roughly the latest generation, purely to save readers a few probes.
+- Commits are **create-only compare-and-swap**: stage everything (Parquet +
+  next catalog), then create the next marker. Losers rebase onto the current
+  head and retry. Crucially, an ambiguous outcome (a timeout) is resolved by
+  one GET of the marker you tried to create — *exact and permanent*, so "did my
+  commit land?" never becomes the caller's problem to reconcile.
+- Readers need zero custom code: resolve the head marker, then
   `ATTACH 'ducklake:…' (READ_ONLY)` — the official frozen-DuckLake pattern.
 
 No sidecar, no epoch holder, no failover story, no lock service. Writers can
 be Lambdas. The serialization point is the S3 conditional write itself —
 supported by AWS S3 (since 2024), GCS, Azure, R2, MinIO, and iDrive E2
-(verified empirically).
+(verified empirically). Because commits are create-only, they depend only on
+`If-None-Match` — the more widely-implemented half of the primitive.
 
 **Verify your endpoint before trusting it**: some S3-compatible stores
-accept `If-Match`/`If-None-Match` headers without enforcing them, which
-would corrupt a lake with zero errors. See the
+accept `If-Match`/`If-None-Match` headers without enforcing them, and some
+enforce them only sequentially (fine for one writer, silently lossy under
+concurrent ones) — either would corrupt a lake with zero errors. See the
 [live-tested compatibility table](docs/compatibility.md) — re-verified
 weekly in CI and on every backend version bump, so it cannot go stale.
-`verify_conditional_writes(store)` runs the same probe against any
-endpoint in one round-trip; the integration and live test lanes run it
-automatically.
+`verify_conditional_writes(store)` checks sequential enforcement in one
+round-trip (the integration lane runs it automatically);
+`probe_capabilities(store)` races concurrent writers to check *atomic*
+enforcement, and `Lake.bootstrap()` gates on it — refusing any backend
+whose create-only isn't atomic under concurrency.
 
 ## Concurrency semantics
 
@@ -56,7 +64,7 @@ DuckLake format:
   so it is opt-in (`replay_all`), never the default.
 - **DDL** conflicts always abort. Run migrations from one place.
 
-The root doc also pins the DuckDB storage version and DuckLake format version:
+Each marker also pins the DuckDB storage version and DuckLake format version:
 a writer with mismatched local versions refuses to commit rather than silently
 auto-migrating the catalog for the whole fleet. Upgrades are explicit.
 
@@ -71,7 +79,7 @@ client = make_s3_client(endpoint_url="https://<s3-compatible-endpoint>")
 store = S3ObjectStore(client, "my-bucket", prefix="lake")
 lake = Lake(store, workdir=Path("/tmp/lake-work"), data_path="s3://my-bucket/lake/data")
 
-lake.bootstrap()                       # once, creates generation 0 + root
+lake.bootstrap()                       # once, creates generation 0 + its marker
 
 with lake.transaction() as tx:         # concurrent writers just do this
     tx.sql("CREATE TABLE events (id INTEGER, msg VARCHAR)")
@@ -84,8 +92,9 @@ with lake.reader() as con:             # readers: stock frozen-DuckLake attach
 ```
 
 Always create S3 clients with `make_s3_client` — it disables botocore's
-transport retries, which would otherwise silently re-send conditional PUTs
-and corrupt the commit protocol's conflict detection.
+transport retries. With immutable markers a self-412 from an SDK retry
+resolves cleanly as WON, but disabling retries keeps the resolution path
+simple.
 
 ## Development
 

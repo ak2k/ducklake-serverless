@@ -32,7 +32,7 @@ from ducklake_serverless.models import (
     MaintenanceReport,
     parse_catalog_key,
 )
-from ducklake_serverless.root import read_root
+from ducklake_serverless.root import resolve_head, write_hint
 
 if TYPE_CHECKING:
     from ducklake_serverless.objectstore import ObjectStore
@@ -98,27 +98,26 @@ def _generation_of(key: str) -> int | None:
 def _collect_locked(
     store: ObjectStore, lease: Lease, retain_generations: int, *, dry_run: bool
 ) -> GcReport:
-    current, _ = read_root(store)
+    current, head_gen = resolve_head(store)
     floor = current.generation - retain_generations + 1
 
     listed = store.list_prefix(CATALOG_PREFIX)
-    # Fail-safe guards against a corrupt or absurd root before any delete:
-    # a poisoned generation number must degrade to keep-everything, never
-    # amplify into sweeping the whole catalog history.
+    # Head is an extant, immutable marker (never a fabricated pointer in v2),
+    # so a "corrupt head generation" is unrepresentable — the v1 absurd-root
+    # guard is retired. One fail-safe survives: the head's catalog must be
+    # present before we sweep, or a listing anomaly could hide live data.
     if not dry_run:
         if current.catalog_key not in listed:
             raise ExternalServiceError(
-                f"root names {current.catalog_key} but it is not in the "
-                "catalog listing — refusing to sweep against a root that "
+                f"head names {current.catalog_key} but it is not in the "
+                "catalog listing — refusing to sweep against a head that "
                 "cannot be verified"
             )
-        parseable = [g for g in (_generation_of(k) for k in listed) if g is not None]
-        if parseable and current.generation > max(parseable):
-            raise ExternalServiceError(
-                f"root generation {current.generation} exceeds the highest "
-                f"listed generation {max(parseable)} — root looks corrupt; "
-                "refusing to sweep"
-            )
+        # Advance the advisory hint to head before sweeping catalogs, so the
+        # window where a stale hint coexists with swept catalogs is minimal
+        # (readers still recover via probe + the catalog-fetch retry — this
+        # is belt-and-suspenders). Never touch roots/: markers are immortal.
+        write_hint(store, head_gen)
 
     swept: list[str] = []
     kept: list[str] = []

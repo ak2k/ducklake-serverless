@@ -31,7 +31,7 @@ from ducklake_serverless.objectstore import (
     make_s3_client,
     verify_conditional_writes,
 )
-from ducklake_serverless.root import read_root
+from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 
 if TYPE_CHECKING:
@@ -156,7 +156,7 @@ def test_process_torture_multi_writer(prefix: str, tmp_path: Path) -> None:
     assert len(acks) == WRITER_PROCS * COMMITS_PER_PROC
 
     store = S3ObjectStore(_client(), BUCKET, prefix=prefix)
-    final, _ = read_root(store)
+    final, _ = resolve_head(store)
     assert final.generation == 1 + len(acks)  # bootstrap + CREATE + appends
 
     verify = make_lake(prefix, tmp_path / "verify")

@@ -1,9 +1,12 @@
 """Protocol data models.
 
-The root document is the single mutable object in the lake; everything else
-is immutable and content-addressed by (generation, uuid). `catalog_key` is a
-derived property — never stored — so a generation/key mismatch is
-unrepresentable.
+Every durable object is immutable and content-addressed. A commit is the
+creation of an immutable per-generation MARKER `roots/<gen>` (create-only)
+whose body is a `RootDoc`; the catalog it names lives at `catalog/<gen>-
+<uuid>`. Both keys are derived from `(generation, uuid)` — never stored —
+so a key/body mismatch is unrepresentable. The only mutable object is the
+advisory `root-hint` (a `HintDoc`, a bare generation number), which no
+correctness path may trust as a document source.
 """
 
 from __future__ import annotations
@@ -19,24 +22,31 @@ from pydantic import BaseModel, ConfigDict, Field
 from ducklake_serverless.errors import InputValidationError
 
 CATALOG_PREFIX = "catalog/"
+ROOTS_PREFIX = "roots/"
 _CATALOG_KEY_RE = re.compile(
     r"^catalog/cat-(?P<gen>\d{8})-(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.duckdb$"
 )
+_MARKER_KEY_RE = re.compile(r"^roots/(?P<gen>\d{8})$")
 
 
 MAX_GENERATION = 10**8 - 1  # the key format zero-pads to exactly 8 digits
 
 
-def format_catalog_key(generation: int, catalog_uuid: UUID) -> str:
-    """Canonical object key for a catalog generation."""
+def _check_generation(generation: int) -> None:
+    """Reject generations the 8-digit zero-padded key format cannot round-trip."""
     if generation < 0:
         raise InputValidationError(f"generation must be >= 0, got {generation}")
     if generation > MAX_GENERATION:
         # Beyond 8 digits the key would format but never parse back —
-        # GC would silently stop sweeping. Fail loudly at the source.
+        # discovery/GC would silently break. Fail loudly at the source.
         raise InputValidationError(
             f"generation {generation} exceeds the 8-digit key format (max {MAX_GENERATION})"
         )
+
+
+def format_catalog_key(generation: int, catalog_uuid: UUID) -> str:
+    """Canonical object key for a catalog generation."""
+    _check_generation(generation)
     return f"{CATALOG_PREFIX}cat-{generation:08d}-{catalog_uuid}.duckdb"
 
 
@@ -46,6 +56,20 @@ def parse_catalog_key(key: str) -> tuple[int, UUID]:
     if m is None:
         raise InputValidationError(f"not a canonical catalog key: {key!r}")
     return int(m.group("gen")), UUID(m.group("uuid"))
+
+
+def format_marker_key(generation: int) -> str:
+    """Canonical object key for a generation marker (the commit point)."""
+    _check_generation(generation)
+    return f"{ROOTS_PREFIX}{generation:08d}"
+
+
+def parse_marker_key(key: str) -> int:
+    """Inverse of `format_marker_key`. Raises on any non-canonical key."""
+    m = _MARKER_KEY_RE.match(key)
+    if m is None:
+        raise InputValidationError(f"not a canonical marker key: {key!r}")
+    return int(m.group("gen"))
 
 
 class WriterInfo(BaseModel):
@@ -59,10 +83,10 @@ class WriterInfo(BaseModel):
 
 
 class RootDoc(BaseModel):
-    """The root pointer: the only mutable object in the lake.
+    """The body of one generation marker (`roots/<gen>`) — immutable.
 
     `created_at` is informational only — ordering comes exclusively from
-    `generation` and CAS, never from clocks.
+    `generation`, never from clocks.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -82,13 +106,43 @@ class RootDoc(BaseModel):
         """Object key of the catalog generation this root names."""
         return format_catalog_key(self.generation, self.catalog_uuid)
 
+    @property
+    def marker_key(self) -> str:
+        """Object key of the marker whose body this is."""
+        return format_marker_key(self.generation)
+
     def to_json_bytes(self) -> bytes:
-        """Serialize for the root object body (schema field aliased)."""
+        """Serialize for the marker object body (schema field aliased)."""
         return self.model_dump_json(by_alias=True).encode()
 
     @classmethod
     def from_json_bytes(cls, data: bytes) -> RootDoc:
-        """Parse a root object body; raises pydantic.ValidationError on mismatch."""
+        """Parse a marker body; raises pydantic.ValidationError on mismatch."""
+        return cls.model_validate_json(data)
+
+
+class HintDoc(BaseModel):
+    """The advisory `root-hint` body: a bare latest-generation number.
+
+    Never a document source — only a probe start position, always verified
+    by GETting the marker it names. A poisoned or regressed hint costs
+    extra probes, never wrong data.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_id: Literal["ducklake-serverless-hint/1"] = Field(
+        default="ducklake-serverless-hint/1", alias="schema"
+    )
+    generation: int = Field(ge=0, le=MAX_GENERATION)
+
+    def to_json_bytes(self) -> bytes:
+        """Serialize for the hint object body (schema field aliased)."""
+        return self.model_dump_json(by_alias=True).encode()
+
+    @classmethod
+    def from_json_bytes(cls, data: bytes) -> HintDoc:
+        """Parse a hint body; raises pydantic.ValidationError on mismatch."""
         return cls.model_validate_json(data)
 
 
