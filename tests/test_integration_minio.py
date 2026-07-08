@@ -20,7 +20,7 @@ import contextlib
 import os
 import uuid
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import pytest
 
@@ -134,6 +134,30 @@ def test_e2e_parquet_over_httpfs(prefix: str, tmp_path: Path) -> None:
     reader_lake = make_lake(prefix, tmp_path / "r")
     with reader_lake.reader() as con:
         assert con.execute("SELECT count(*), sum(id) FROM events") == [(100000, 4999950000)]
+
+
+@requires_minio
+def test_streaming_reader_matches_download(prefix: str, tmp_path: Path) -> None:
+    """reader(stream=True) attaches the catalog directly over httpfs (no
+
+    download) and returns the same rows as the default download path;
+    stream="auto" falls back to download for a small catalog. sum(id) forces a
+    real Parquet scan over httpfs, so this proves the streamed catalog resolves
+    its data files correctly, not just its metadata.
+    """
+    lake = make_lake(prefix, tmp_path / "w")
+    lake.bootstrap()
+    with lake.transaction() as tx:
+        tx.sql("CREATE TABLE events (id INTEGER, k INTEGER)")
+        tx.sql("INSERT INTO events SELECT range, range % 10 FROM range(100000)")
+
+    query = "SELECT count(*), sum(id), count(*) FILTER (WHERE k = 3) FROM events"
+    expected = [(100000, 4999950000, 10000)]
+    modes: list[bool | Literal["auto"]] = [False, True, "auto"]
+    for mode in modes:
+        reader_lake = make_lake(prefix, tmp_path / f"r-{mode}")
+        with reader_lake.reader(stream=mode) as con:
+            assert con.execute(query) == expected, mode
 
 
 @requires_minio

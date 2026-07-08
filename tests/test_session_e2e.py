@@ -19,6 +19,7 @@ from ducklake_serverless.errors import (
     BackendUnsafeError,
     CatalogHygieneError,
     ConflictAbortError,
+    ExternalServiceError,
     VersionMismatchError,
 )
 from ducklake_serverless.generation import check_hygiene
@@ -58,6 +59,24 @@ def test_bootstrap_twice_adopts_existing(lake: Lake) -> None:
     second = lake.bootstrap()
     assert second.generation == 0
     assert second.catalog_uuid == first.catalog_uuid  # the marker that won
+
+
+def test_reader_stream_requires_s3_store(lake: Lake) -> None:
+    """stream=True is unsupported on a non-S3 store (httpfs needs an s3:// URI);
+
+    stream="auto" degrades to the download path and still reads. The streaming
+    path itself is exercised end-to-end against MinIO in the integration lane.
+    """
+    lake.bootstrap()
+    with lake.transaction() as tx:
+        tx.sql("CREATE TABLE t (v INTEGER)")
+        tx.sql("INSERT INTO t VALUES (1), (2)")
+
+    with pytest.raises(ExternalServiceError, match="S3-backed"), lake.reader(stream=True):
+        pass  # entering the reader resolves the stream decision and raises
+
+    with lake.reader(stream="auto") as con:  # non-S3 → falls back to download
+        assert con.execute("SELECT count(*), sum(v) FROM t") == [(2, 3)]
 
 
 class _NonAtomicCreate(InMemoryObjectStore):

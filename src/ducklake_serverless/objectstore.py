@@ -193,6 +193,24 @@ class S3ObjectStore:
         except botocore.exceptions.ClientError as exc:
             raise ExternalServiceError(f"delete {key!r}") from exc
 
+    def size(self, key: str) -> int:
+        """Object size in bytes via a HEAD — no body transfer.
+
+        Used by the streaming reader's `auto` heuristic to decide whether a
+        catalog is large enough that httpfs range-reads beat a full download.
+        """
+        try:
+            resp = self._client.head_object(Bucket=self._bucket, Key=self._full(key))
+        except botocore.exceptions.ClientError as exc:
+            if _error_code(exc) in ("NoSuchKey", "404") or _status(exc) == HTTPStatus.NOT_FOUND:
+                raise ObjectNotFoundError(key) from exc
+            raise ExternalServiceError(f"head {key!r}") from exc
+        return int(resp["ContentLength"])
+
+    def s3_uri(self, key: str) -> str:
+        """The `s3://…` URI DuckDB httpfs can ATTACH directly (streaming reads)."""
+        return f"s3://{self._bucket}/{self._full(key)}"
+
     @staticmethod
     def _raise_conditional(exc: botocore.exceptions.ClientError, key: str) -> None:
         """Map conditional-write failures; fall through for anything else."""

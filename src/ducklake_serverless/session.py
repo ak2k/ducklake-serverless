@@ -19,7 +19,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID, uuid4
 
 from ducklake_serverless import __version__
@@ -51,7 +51,11 @@ from ducklake_serverless.models import (
     WriterInfo,
     format_catalog_key,
 )
-from ducklake_serverless.objectstore import probe_atomic_create, probe_capabilities
+from ducklake_serverless.objectstore import (
+    S3ObjectStore,
+    probe_atomic_create,
+    probe_capabilities,
+)
 from ducklake_serverless.rebase import decide_rebase
 from ducklake_serverless.recorder import record
 from ducklake_serverless.root import (
@@ -72,6 +76,11 @@ if TYPE_CHECKING:
 DEFAULT_MAX_ATTEMPTS = 5
 _BACKOFF_BASE_S = 0.05
 _BACKOFF_CAP_S = 2.0
+
+# reader(stream="auto") streams over httpfs only above this catalog size. Below
+# it, one bulk download beats httpfs's ~16 range GETs (measured crossover is in
+# the tens of MB on a ~30ms-RTT link — see docs/benchmarks/httpfs-read-path.md).
+STREAM_MIN_BYTES = 32 * 1024 * 1024
 
 
 def _writer_info() -> WriterInfo:
@@ -470,8 +479,29 @@ class Lake:
             GenerationCache.discard(work)
 
     @contextmanager
-    def reader(self) -> Generator[LakeConnection]:
-        """Attach the current generation READ_ONLY (frozen-DuckLake pattern)."""
+    def reader(self, *, stream: bool | Literal["auto"] = False) -> Generator[LakeConnection]:
+        """Attach the current generation READ_ONLY (frozen-DuckLake pattern).
+
+        `stream` selects how the catalog is fetched:
+
+        - `False` (default): download the catalog, attach the local copy. One
+          bulk GET — best for the common case (small catalog, or any backend).
+        - `True`: attach the catalog directly from S3 over httpfs, no download.
+          Requires an S3-backed store and credentials. A selective read pulls
+          only the blocks it needs (fewer bytes for a large catalog) but takes
+          ~16 range GETs vs one download, so it only wins for a LARGE catalog
+          over a HIGH-LATENCY backend.
+        - `"auto"`: stream only when the store is S3-backed and the catalog is
+          at least `STREAM_MIN_BYTES`; otherwise download.
+        """
+        stream_store = self._stream_store(stream)
+        if stream_store is not None:
+            connection = self._open_streaming_reader(stream_store)
+            try:
+                yield connection
+            finally:
+                connection.abandon()
+            return
         _, path = self._fetch_current_base()
         try:
             connection = LakeConnection(
@@ -485,6 +515,51 @@ class Lake:
         finally:
             connection.abandon()
             GenerationCache.discard(path)
+
+    def _stream_store(self, stream: bool | Literal["auto"]) -> S3ObjectStore | None:
+        """The S3 store to stream the catalog from, or None to download instead.
+
+        Returning the narrowed store (not a bool) lets the httpfs path stay
+        typed without an assert.
+        """
+        if stream is False:
+            return None
+        store = self._store
+        if not isinstance(store, S3ObjectStore):
+            if stream is True:
+                raise ExternalServiceError("streaming reads require an S3-backed store")
+            return None  # auto on a non-S3 store → download
+        if self._s3_credentials is None:
+            if stream is True:
+                raise ExternalServiceError("streaming reads require s3_credentials for httpfs")
+            return None  # auto with no creds → download
+        if stream is True:
+            return store
+        base, _ = resolve_head(store)  # auto: only stream a large catalog
+        key = format_catalog_key(base.generation, base.catalog_uuid)
+        return store if store.size(key) >= STREAM_MIN_BYTES else None
+
+    def _open_streaming_reader(self, store: S3ObjectStore) -> LakeConnection:
+        """Attach the current head's catalog directly from S3 (httpfs), no download.
+
+        GC may sweep the resolved generation before the attach lands; re-resolve
+        and retry, mirroring `_fetch_current_base`'s download-path race handling.
+        """
+        last_exc: ExternalServiceError | None = None
+        for _ in range(self._max_attempts):
+            base, _ = resolve_head(store)
+            self._check_versions(base)
+            uri = store.s3_uri(format_catalog_key(base.generation, base.catalog_uuid))
+            try:
+                return LakeConnection(
+                    uri, data_path=None, read_only=True, s3_credentials=self._s3_credentials
+                )
+            except ExternalServiceError as exc:  # catalog may have been swept mid-attach
+                last_exc = exc
+        raise ExternalServiceError(
+            f"streaming attach for the current head kept failing across "
+            f"{self._max_attempts} attempts"
+        ) from last_exc
 
     def _check_versions(self, root: RootDoc) -> None:
         """Refuse to write when local versions differ from the lake's pins.

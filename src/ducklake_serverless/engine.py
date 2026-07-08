@@ -75,12 +75,14 @@ class LakeConnection:
 
     def __init__(
         self,
-        catalog_path: Path,
+        catalog_path: str | Path,
         data_path: str | None,
         *,
         read_only: bool = False,
         s3_credentials: S3Credentials | None = None,
     ) -> None:
+        # `catalog_path` is normally a local file; for a streaming read it is an
+        # `s3://…` URI attached directly over httpfs (see Lake.reader stream=).
         self._con = duckdb.connect()
         try:
             self._con.execute("INSTALL ducklake; LOAD ducklake;")
