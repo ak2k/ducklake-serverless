@@ -77,6 +77,12 @@ DEFAULT_MAX_ATTEMPTS = 5
 _BACKOFF_BASE_S = 0.05
 _BACKOFF_CAP_S = 2.0
 
+# DuckLake's entries in the generic RootDoc.pins mapping. These move to the
+# DuckLakeCatalog payload adapter once the commit driver is extracted; for now
+# the still-DuckLake-coupled Lake writes and reads them here.
+_PIN_DUCKDB_VERSION = "duckdb_storage_version"
+_PIN_DUCKLAKE_FORMAT = "ducklake_format_version"
+
 # reader(stream="auto") streams over httpfs only above this catalog size. Below
 # it, one bulk download beats httpfs's ~16 range GETs (measured crossover is in
 # the tens of MB on a ~30ms-RTT link — see docs/benchmarks/httpfs-read-path.md).
@@ -218,10 +224,12 @@ class Lake:
             doc = RootDoc(
                 generation=0,
                 catalog_uuid=catalog_uuid,
-                duckdb_storage_version=DUCKDB_VERSION,
-                ducklake_format_version=probe_ducklake_format_version(catalog_path),
                 created_at=datetime.now(tz=UTC),
                 writer=_writer_info(),
+                pins={
+                    _PIN_DUCKDB_VERSION: DUCKDB_VERSION,
+                    _PIN_DUCKLAKE_FORMAT: probe_ducklake_format_version(catalog_path),
+                },
             )
             match self._create_marker_resolving(doc, catalog_uuid, 0):
                 case MarkerOutcome.WON:
@@ -279,11 +287,12 @@ class Lake:
         it attaches; the duckdb-version pin cannot catch that — the extension
         versions independently — so probe the file itself before it ships.
         """
+        base_format = base.pins.get(_PIN_DUCKLAKE_FORMAT)
         work_format = probe_ducklake_format_version(work)
-        if work_format != base.ducklake_format_version:
+        if work_format != base_format:
             raise VersionMismatchError(
                 f"local ducklake extension migrated the catalog format "
-                f"({base.ducklake_format_version} -> {work_format}); "
+                f"({base_format} -> {work_format}); "
                 "publishing would break other readers. Upgrade the lake "
                 "explicitly instead."
             )
@@ -567,8 +576,9 @@ class Lake:
         A newer ducklake extension would silently migrate the catalog format
         for the whole fleet on ATTACH; upgrades must be explicit.
         """
-        if root.duckdb_storage_version != DUCKDB_VERSION:
+        lake_duckdb = root.pins.get(_PIN_DUCKDB_VERSION)
+        if lake_duckdb != DUCKDB_VERSION:
             raise VersionMismatchError(
-                f"lake pins duckdb {root.duckdb_storage_version}, "
+                f"lake pins duckdb {lake_duckdb}, "
                 f"local is {DUCKDB_VERSION}; upgrade the lake explicitly"
             )

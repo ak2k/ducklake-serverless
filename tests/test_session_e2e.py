@@ -48,7 +48,7 @@ def lake(tmp_path: Path, store: InMemoryObjectStore) -> Lake:
 def test_bootstrap_creates_generation_zero(lake: Lake, store: InMemoryObjectStore) -> None:
     doc = lake.bootstrap()
     assert doc.generation == 0
-    assert doc.duckdb_storage_version == DUCKDB_VERSION
+    assert doc.pins["duckdb_storage_version"] == DUCKDB_VERSION
     current, _ = resolve_head(store)
     assert current == doc
 
@@ -194,7 +194,9 @@ def test_version_mismatch_refused(lake: Lake, store: InMemoryObjectStore) -> Non
     head, _ = resolve_head(store)
     # Plant a foreign-version marker as the new head; the writer's pre-attach
     # version check must refuse to build on it.
-    pinned = head.model_copy(update={"generation": 1, "duckdb_storage_version": "v0.0.1-other"})
+    pinned = head.model_copy(
+        update={"generation": 1, "pins": {**head.pins, "duckdb_storage_version": "v0.0.1-other"}}
+    )
     store.put_if_absent(pinned.marker_key, pinned.to_json_bytes())
 
     with pytest.raises(VersionMismatchError), lake.transaction() as tx:

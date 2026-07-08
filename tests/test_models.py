@@ -25,8 +25,7 @@ def make_root(generation: int = 0, catalog_uuid: UUID | None = None) -> RootDoc:
     return RootDoc(
         generation=generation,
         catalog_uuid=catalog_uuid or uuid4(),
-        duckdb_storage_version="v1.4.0",
-        ducklake_format_version="0.3",
+        pins={"duckdb_storage_version": "v1.4.0", "ducklake_format_version": "0.3"},
         created_at=datetime.now(tz=UTC),
         writer=WriterInfo(lib_version="0.1.0", host="test", pid=1),
     )

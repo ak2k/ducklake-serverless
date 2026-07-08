@@ -96,10 +96,12 @@ class RootDoc(BaseModel):
     )
     generation: int = Field(ge=0, le=MAX_GENERATION)
     catalog_uuid: UUID
-    duckdb_storage_version: str
-    ducklake_format_version: str
     created_at: datetime
     writer: WriterInfo
+    # Adapter-supplied version tags (e.g. duckdb/ducklake versions) so a future
+    # writer can refuse a silent format migration. Empty for an opaque blob;
+    # the engine never interprets these — only the payload adapter does.
+    pins: dict[str, str] = Field(default_factory=dict)
 
     @property
     def catalog_key(self) -> str:
