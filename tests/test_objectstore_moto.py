@@ -18,6 +18,7 @@ import pytest
 from moto import mock_aws
 
 from ducklake_serverless.errors import (
+    AmbiguousCasError,
     ExternalServiceError,
     ObjectNotFoundError,
     PreconditionFailedError,
@@ -25,6 +26,7 @@ from ducklake_serverless.errors import (
 from ducklake_serverless.objectstore import (
     InMemoryObjectStore,
     S3ObjectStore,
+    probe_atomic_create,
     probe_capabilities,
     verify_conditional_writes,
 )
@@ -172,3 +174,21 @@ def test_probe_capabilities_flags_nonatomic_create() -> None:
     # ...but the marker protocol serializes on create-only, so a CAS-only
     # backend cannot host a lake — can_host_lake tracks atomic_create.
     assert not caps.can_host_lake
+
+
+def test_probe_fails_loud_on_ambiguous_racer() -> None:
+    """A probe whose contenders hit an ambiguous/unexpected outcome must RAISE,
+
+    not silently miscount winners — an undercount could certify an unsafe
+    backend as atomic. The safety gate fails loud instead.
+    """
+
+    class AmbiguousCreate(InMemoryObjectStore):
+        @override
+        def put_if_absent(self, key: str, body: bytes) -> str:
+            if key.startswith("cap-probe"):
+                raise AmbiguousCasError(f"{key}: outcome unknown (injected)")
+            return super().put_if_absent(key, body)
+
+    with pytest.raises(ExternalServiceError, match="indeterminate"):
+        probe_atomic_create(AmbiguousCreate(), racers=4)

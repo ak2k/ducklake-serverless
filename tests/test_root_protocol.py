@@ -184,3 +184,46 @@ def test_gallop_discovery_over_long_chain() -> None:
         create_marker(store, make_root(generation=gen))  # no hint written
     _, gen = resolve_head(store)
     assert gen == 199
+
+
+def test_resolve_head_stops_at_max_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Head resolution must terminate at MAX_GENERATION, never probe past it.
+
+    generation MAX+1 is unformattable (format_marker_key raises
+    InputValidationError), which only ObjectNotFoundError is caught around — so
+    without the boundary guard, a head sitting at MAX would crash both the
+    forward-probe and the gallop-discovery paths. With MAX patched small, this
+    exercises both guards on a lake whose head IS the max generation.
+    """
+    monkeypatch.setattr("ducklake_serverless.root.MAX_GENERATION", 3)
+    monkeypatch.setattr("ducklake_serverless.models.MAX_GENERATION", 3)
+    store = InMemoryObjectStore()
+    docs = commit_chain(store, through=3)  # head == MAX_GENERATION
+
+    doc, gen = resolve_head(store)  # forward-probe path (valid hint at head)
+    assert gen == 3
+    assert doc == docs[3]
+
+    store.delete(ROOT_HINT_KEY)  # gallop-discovery path (no hint)
+    doc, gen = resolve_head(store)
+    assert gen == 3
+    assert doc == docs[3]
+
+
+def test_resolve_head_probe_cap_returns_valid_recent_head(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the forward probe hits PROBE_CAP it returns the most recent head it
+
+    reached — always a real, committed generation, never an error or a loop. A
+    recent head is valid; nobody needs the exact instantaneous frontier.
+    """
+    monkeypatch.setattr("ducklake_serverless.root.PROBE_CAP", 3)
+    store = InMemoryObjectStore()
+    commit_chain(store, through=20)
+    store.put(ROOT_HINT_KEY, HintDoc(generation=0).to_json_bytes())  # force a long forward probe
+
+    doc, gen = resolve_head(store)
+    # Only 3 galloping probes fit under the cap, so it stops strictly BELOW the
+    # true head (20) — proving the cap bounded the walk — yet still returns a
+    # real, committed generation it actually reached.
+    assert 0 < gen < 20
+    assert read_marker(store, gen) == doc
