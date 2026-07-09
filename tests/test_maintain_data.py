@@ -203,7 +203,7 @@ def test_pinned_reader_within_contract_survives_maintenance(
     verify = Lake(store, workdir=tmp_path / "pin", data_path=str(tmp_path / "data"))
     (tmp_path / "pin").mkdir()
     path = verify._cache.fetch_copy(  # pyright: ignore[reportPrivateUsage]
-        pinned_root.generation, pinned_root.catalog_uuid
+        pinned_root.generation, pinned_root.payload_uuid
     )
     con = LakeConnection(path, data_path=None, read_only=True)
     # Value-forcing read through the PINNED generation's catalog.

@@ -93,12 +93,12 @@ def test_conformance_if_match_on_missing_key_is_not_found(store: S3ObjectStore) 
 
 
 def test_list_prefix_scoped(store: S3ObjectStore) -> None:
-    store.put_if_absent("catalog/cat-a.duckdb", b"a")
-    store.put_if_absent("catalog/cat-b.duckdb", b"b")
+    store.put_if_absent("payload/cat-a.duckdb", b"a")
+    store.put_if_absent("payload/cat-b.duckdb", b"b")
     store.put_if_absent("data/f.parquet", b"d")
-    assert store.list_prefix("catalog/") == [
-        "catalog/cat-a.duckdb",
-        "catalog/cat-b.duckdb",
+    assert store.list_prefix("payload/") == [
+        "payload/cat-a.duckdb",
+        "payload/cat-b.duckdb",
     ]
 
 

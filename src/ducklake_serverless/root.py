@@ -90,7 +90,7 @@ def resolve_marker(store: ObjectStore, generation: int, our_uuid: UUID) -> Marke
         doc = read_marker(store, generation)
     except ObjectNotFoundError:
         return MarkerOutcome.ABSENT
-    return MarkerOutcome.WON if doc.catalog_uuid == our_uuid else MarkerOutcome.LOST
+    return MarkerOutcome.WON if doc.payload_uuid == our_uuid else MarkerOutcome.LOST
 
 
 def write_hint(store: ObjectStore, generation: int) -> None:

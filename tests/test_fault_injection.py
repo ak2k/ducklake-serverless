@@ -223,7 +223,7 @@ def test_replay_onto_version_mismatched_head_refused(
                     foreign = head.model_copy(
                         update={
                             "generation": head.generation + 1,
-                            "duckdb_storage_version": "v0.0.1-foreign",
+                            "pins": {**head.pins, "duckdb_storage_version": "v0.0.1-foreign"},
                         }
                     )
                     self._inner.put_if_absent(foreign.marker_key, foreign.to_json_bytes())

@@ -24,7 +24,7 @@ import pytest
 
 from ducklake_serverless.errors import ConflictAbortError
 from ducklake_serverless.gc import collect, maintain_data
-from ducklake_serverless.models import parse_catalog_key
+from ducklake_serverless.models import parse_payload_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
 from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
@@ -206,7 +206,7 @@ def test_writers_with_concurrent_gc_hold_invariants(tmp_path: Path) -> None:
     # Retention respected: at most retain_generations catalogs remain
     # (plus any not-yet-swept tail from the final commits).
     final, _ = resolve_head(store)
-    kept = [parse_catalog_key(k)[0] for k in store.list_prefix("catalog/")]
+    kept = [parse_payload_key(k)[0] for k in store.list_prefix("payload/")]
     assert final.generation in kept
 
 

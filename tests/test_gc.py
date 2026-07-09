@@ -10,7 +10,7 @@ from ducklake_serverless.engine import LakeConnection
 from ducklake_serverless.errors import ExternalServiceError
 from ducklake_serverless.gc import collect
 from ducklake_serverless.lease import Lease
-from ducklake_serverless.models import HintDoc, parse_catalog_key
+from ducklake_serverless.models import HintDoc, parse_payload_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
 from ducklake_serverless.root import ROOT_HINT_KEY, resolve_head
 from ducklake_serverless.session import Lake
@@ -48,10 +48,10 @@ def setup_lake_with_history(lake: Lake, commits: int) -> None:
 
 def test_dry_run_deletes_nothing(lake: Lake, store: InMemoryObjectStore) -> None:
     setup_lake_with_history(lake, commits=8)  # generations 0..9
-    before = set(store.list_prefix("catalog/"))
+    before = set(store.list_prefix("payload/"))
     report = collect(store, "gc-test", retain_generations=3, dry_run=True)
     assert report is not None and report.dry_run
-    assert set(store.list_prefix("catalog/")) == before
+    assert set(store.list_prefix("payload/")) == before
     assert len(report.swept_catalogs) == 7  # 0..6 outside window {7,8,9}
 
 
@@ -59,8 +59,8 @@ def test_sweep_respects_retention_window(lake: Lake, store: InMemoryObjectStore)
     setup_lake_with_history(lake, commits=8)  # generations 0..9
     report = collect(store, "gc-test", retain_generations=3, dry_run=False)
     assert report is not None
-    remaining = store.list_prefix("catalog/")
-    generations = sorted(parse_catalog_key(k)[0] for k in remaining)
+    remaining = store.list_prefix("payload/")
+    generations = sorted(parse_payload_key(k)[0] for k in remaining)
     assert generations == [7, 8, 9]
 
 
@@ -69,31 +69,31 @@ def test_current_generation_never_swept(lake: Lake, store: InMemoryObjectStore) 
     report = collect(store, "gc-test", retain_generations=1, dry_run=False)
     assert report is not None
     current, _ = resolve_head(store)
-    assert store.list_prefix("catalog/") == [current.catalog_key]
+    assert store.list_prefix("payload/") == [current.payload_key]
 
 
 def test_lost_cas_orphans_outside_window_are_swept(
     lake: Lake, store: InMemoryObjectStore, tmp_path: Path
 ) -> None:
     setup_lake_with_history(lake, commits=8)
-    # Plant an orphan: a catalog uploaded by a loser whose CAS never landed.
+    # Plant an orphan: a payload uploaded by a loser whose CAS never landed.
     current, _ = resolve_head(store)
-    orphan_key = "catalog/cat-00000002-99999999-9999-4999-8999-999999999999.duckdb"
-    store.put_if_absent(orphan_key, store.get(current.catalog_key).body)
+    orphan_key = "payload/00000002-99999999-9999-4999-8999-999999999999"
+    store.put_if_absent(orphan_key, store.get(current.payload_key).body)
 
     report = collect(store, "gc-test", retain_generations=3, dry_run=False)
     assert report is not None
     assert orphan_key in report.swept_catalogs
-    assert orphan_key not in store.list_prefix("catalog/")
+    assert orphan_key not in store.list_prefix("payload/")
 
 
 def test_unknown_objects_under_catalog_prefix_kept(lake: Lake, store: InMemoryObjectStore) -> None:
     setup_lake_with_history(lake, commits=2)
-    store.put_if_absent("catalog/README.txt", b"do not delete me")
+    store.put_if_absent("payload/README.txt", b"do not delete me")
     report = collect(store, "gc-test", retain_generations=1, dry_run=False)
     assert report is not None
-    assert "catalog/README.txt" in report.kept_catalogs
-    assert "catalog/README.txt" in store.list_prefix("catalog/")
+    assert "payload/README.txt" in report.kept_catalogs
+    assert "payload/README.txt" in store.list_prefix("payload/")
 
 
 def test_gc_yields_to_lease_holder(lake: Lake, store: InMemoryObjectStore) -> None:
@@ -117,7 +117,7 @@ def test_reader_pinned_inside_window_survives_gc(
     # The pinned generation must still be fetchable and attachable.
     verify = Lake(store, workdir=tmp_path / "pinned", data_path=str(tmp_path / "data"))
     (tmp_path / "pinned").mkdir()
-    path = verify._cache.fetch_copy(pinned.generation, pinned.catalog_uuid)  # pyright: ignore[reportPrivateUsage]
+    path = verify._cache.fetch_copy(pinned.generation, pinned.payload_uuid)  # pyright: ignore[reportPrivateUsage]
     con = LakeConnection(path, data_path=None, read_only=True)
     rows = con.execute("SELECT count(*) FROM t")
     assert rows == [(5,)]  # the state as of the pinned generation
@@ -133,7 +133,7 @@ def test_sweep_refuses_when_root_names_missing_catalog(
     """
     setup_lake_with_history(lake, commits=3)
     current, _ = resolve_head(store)
-    store.delete(current.catalog_key)  # simulate corruption/partial listing
+    store.delete(current.payload_key)  # simulate corruption/partial listing
 
     with pytest.raises(ExternalServiceError, match="refusing to sweep"):
         collect(store, "gc-test", retain_generations=1, dry_run=False)
@@ -148,12 +148,12 @@ def test_absurd_hint_does_not_cause_a_wrong_sweep(lake: Lake, store: InMemoryObj
     store.put(ROOT_HINT_KEY, HintDoc(generation=9999).to_json_bytes())
     report = collect(store, "gc-test", retain_generations=3, dry_run=False)
     assert report is not None
-    remaining = sorted(parse_catalog_key(k)[0] for k in store.list_prefix("catalog/"))
+    remaining = sorted(parse_payload_key(k)[0] for k in store.list_prefix("payload/"))
     assert remaining == [7, 8, 9]  # correct window despite the poison hint
 
 
 def test_gc_never_sweeps_markers(lake: Lake, store: InMemoryObjectStore) -> None:
-    """Markers are immortal — GC touches catalog/ only, never roots/."""
+    """Markers are immortal — GC touches payload/ only, never roots/."""
     setup_lake_with_history(lake, commits=8)
     markers_before = set(store.list_prefix("roots/"))
     collect(store, "gc-test", retain_generations=1, dry_run=False)

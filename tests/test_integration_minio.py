@@ -205,7 +205,7 @@ def test_gc_against_real_store(prefix: str, tmp_path: Path) -> None:
     store = S3ObjectStore(_client(), BUCKET, prefix=prefix)
     report = collect(store, "it-gc", retain_generations=3, dry_run=False)
     assert report is not None
-    remaining = store.list_prefix("catalog/")
+    remaining = store.list_prefix("payload/")
     assert len(remaining) == 3
 
     reader_lake = make_lake(prefix, tmp_path / "r")
