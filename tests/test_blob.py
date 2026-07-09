@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from ducklake_serverless import blob
-from ducklake_serverless.models import Abort, RootDoc, WriterInfo, format_catalog_key
+from ducklake_serverless.models import Abort, RootDoc, WriterInfo, format_payload_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
 
 if TYPE_CHECKING:
@@ -40,7 +40,7 @@ def test_blob_bootstrap_read_write_history(tmp_path: Path) -> None:
     assert bs.head().generation == 2
 
     # Time travel: earlier generations are immutable and still resolvable.
-    assert store.get(format_catalog_key(0, doc.catalog_uuid)).body == b"v0"
+    assert store.get(format_payload_key(0, doc.payload_uuid)).body == b"v0"
 
 
 def test_blob_bootstrap_defaults_to_empty(tmp_path: Path) -> None:
@@ -53,7 +53,7 @@ def test_blob_bootstrap_defaults_to_empty(tmp_path: Path) -> None:
 def _root() -> RootDoc:
     return RootDoc(
         generation=0,
-        catalog_uuid=uuid4(),
+        payload_uuid=uuid4(),
         created_at=datetime.now(tz=UTC),
         writer=WriterInfo(lib_version="0.1.0", host="test", pid=1),
     )

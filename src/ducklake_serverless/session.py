@@ -38,7 +38,7 @@ from ducklake_serverless.models import (
     ConflictPolicy,
     RootDoc,
     Statement,
-    format_catalog_key,
+    format_payload_key,
 )
 from ducklake_serverless.objectstore import S3ObjectStore
 from ducklake_serverless.rebase import decide_rebase
@@ -168,18 +168,18 @@ class Lake:
         """
         if verify_backend:
             commit.require_atomic_create(self._store)
-        catalog_uuid = uuid4()
-        catalog_path = self._workdir / f"bootstrap-{catalog_uuid}.duckdb"
+        payload_uuid = uuid4()
+        catalog_path = self._workdir / f"bootstrap-{payload_uuid}.duckdb"
         connection = LakeConnection(
             catalog_path, self._data_path, s3_credentials=self._s3_credentials
         )
         connection.close()
 
         try:
-            publish_generation(self._store, catalog_path, 0, catalog_uuid)
+            publish_generation(self._store, catalog_path, 0, payload_uuid)
             doc = RootDoc(
                 generation=0,
-                catalog_uuid=catalog_uuid,
+                payload_uuid=payload_uuid,
                 created_at=datetime.now(tz=UTC),
                 writer=writer_info(),
                 pins={
@@ -188,7 +188,7 @@ class Lake:
                 },
             )
             outcome = commit.create_marker_resolving(
-                self._store, doc, catalog_uuid, 0, self._max_attempts
+                self._store, doc, payload_uuid, 0, self._max_attempts
             )
             match outcome:
                 case MarkerOutcome.WON:
@@ -290,7 +290,7 @@ class Lake:
             base, _ = resolve_head(self._store)
             self._check_versions(base)
             try:
-                return base, self._cache.fetch_copy(base.generation, base.catalog_uuid)
+                return base, self._cache.fetch_copy(base.generation, base.payload_uuid)
             except ObjectNotFoundError:
                 continue
         raise ExternalServiceError(
@@ -378,7 +378,7 @@ class Lake:
         if stream is True:
             return store
         base, _ = resolve_head(store)  # auto: only stream a large catalog
-        key = format_catalog_key(base.generation, base.catalog_uuid)
+        key = format_payload_key(base.generation, base.payload_uuid)
         return store if store.size(key) >= STREAM_MIN_BYTES else None
 
     def _open_streaming_reader(self, store: S3ObjectStore) -> LakeConnection:
@@ -391,7 +391,7 @@ class Lake:
         for _ in range(self._max_attempts):
             base, _ = resolve_head(store)
             self._check_versions(base)
-            uri = store.s3_uri(format_catalog_key(base.generation, base.catalog_uuid))
+            uri = store.s3_uri(format_payload_key(base.generation, base.payload_uuid))
             try:
                 return LakeConnection(
                     uri, data_path=None, read_only=True, s3_credentials=self._s3_credentials

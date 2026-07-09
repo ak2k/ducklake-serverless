@@ -84,7 +84,7 @@ def test_resolve_marker_won() -> None:
     store = InMemoryObjectStore()
     ours = make_root(generation=0)
     create_marker(store, ours)  # landed; pretend we never saw the 200
-    assert resolve_marker(store, 0, ours.catalog_uuid) is MarkerOutcome.WON
+    assert resolve_marker(store, 0, ours.payload_uuid) is MarkerOutcome.WON
 
 
 def test_resolve_marker_lost() -> None:
@@ -92,12 +92,12 @@ def test_resolve_marker_lost() -> None:
     theirs = make_root(generation=0)
     create_marker(store, theirs)
     ours = make_root(generation=0)
-    assert resolve_marker(store, 0, ours.catalog_uuid) is MarkerOutcome.LOST
+    assert resolve_marker(store, 0, ours.payload_uuid) is MarkerOutcome.LOST
 
 
 def test_resolve_marker_absent() -> None:
     store = InMemoryObjectStore()
-    assert resolve_marker(store, 0, make_root().catalog_uuid) is MarkerOutcome.ABSENT
+    assert resolve_marker(store, 0, make_root().payload_uuid) is MarkerOutcome.ABSENT
 
 
 def test_won_is_permanent_across_successors() -> None:
@@ -108,7 +108,7 @@ def test_won_is_permanent_across_successors() -> None:
     for gen in range(1, 20):  # extend head far past our gen 0
         create_marker(store, make_root(generation=gen))
     # Head is now 19; our gen-0 evidence is untouched and still definitive.
-    assert resolve_marker(store, 0, ours.catalog_uuid) is MarkerOutcome.WON
+    assert resolve_marker(store, 0, ours.payload_uuid) is MarkerOutcome.WON
 
 
 def test_exactly_one_winner_per_generation() -> None:

@@ -58,7 +58,7 @@ def test_bootstrap_twice_adopts_existing(lake: Lake) -> None:
     first = lake.bootstrap()
     second = lake.bootstrap()
     assert second.generation == 0
-    assert second.catalog_uuid == first.catalog_uuid  # the marker that won
+    assert second.payload_uuid == first.payload_uuid  # the marker that won
 
 
 def test_reader_stream_requires_s3_store(lake: Lake) -> None:
@@ -147,7 +147,7 @@ def test_stock_duckdb_reads_published_generation(
         tx.sql("INSERT INTO t VALUES (42)")
 
     doc, _ = resolve_head(store)
-    raw = store.get(doc.catalog_key).body
+    raw = store.get(doc.payload_key).body
     catalog = tmp_path / "stock-reader.duckdb"
     catalog.write_bytes(raw)
 
@@ -165,7 +165,7 @@ def test_failed_transaction_publishes_nothing(lake: Lake, store: InMemoryObjectS
         raise RuntimeError("boom")
     doc, _ = resolve_head(store)
     assert doc.generation == 0
-    assert len(store.list_prefix("catalog/")) == 1  # only generation 0
+    assert len(store.list_prefix("payload/")) == 1  # only generation 0
 
 
 def test_lost_ddl_race_aborts(lake: Lake, store: InMemoryObjectStore, tmp_path: Path) -> None:

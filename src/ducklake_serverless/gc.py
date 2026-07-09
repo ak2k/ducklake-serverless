@@ -4,7 +4,7 @@ Two independent, separately-invocable passes share one fleet-wide lease
 (same LEASE_KEY — catalog GC and data maintenance are intentionally
 mutually exclusive; a co-scheduled run returns None and retries later):
 
-- ``collect`` — sweeps expired catalog/ generation objects (never the
+- ``collect`` — sweeps expired payload/ generation objects (never the
   current generation, never anything inside the count-based retention
   window). Also collects lost-CAS orphan catalogs.
 - ``maintain_data`` — DuckLake's own snapshot expiry + physical file
@@ -28,9 +28,9 @@ from typing import TYPE_CHECKING
 from ducklake_serverless.errors import ExternalServiceError, InputValidationError
 from ducklake_serverless.lease import Lease
 from ducklake_serverless.models import (
-    CATALOG_PREFIX,
+    PAYLOAD_PREFIX,
     MaintenanceReport,
-    parse_catalog_key,
+    parse_payload_key,
 )
 from ducklake_serverless.root import resolve_head, write_hint
 
@@ -90,7 +90,7 @@ _RENEW_EVERY = 50
 def _generation_of(key: str) -> int | None:
     """Generation encoded in a canonical catalog key, or None."""
     try:
-        return parse_catalog_key(key)[0]
+        return parse_payload_key(key)[0]
     except InputValidationError:
         return None
 
@@ -101,15 +101,15 @@ def _collect_locked(
     current, head_gen = resolve_head(store)
     floor = current.generation - retain_generations + 1
 
-    listed = store.list_prefix(CATALOG_PREFIX)
+    listed = store.list_prefix(PAYLOAD_PREFIX)
     # Head is an extant, immutable marker (never a fabricated pointer in v2),
     # so a "corrupt head generation" is unrepresentable — the v1 absurd-root
     # guard is retired. One fail-safe survives: the head's catalog must be
     # present before we sweep, or a listing anomaly could hide live data.
     if not dry_run:
-        if current.catalog_key not in listed:
+        if current.payload_key not in listed:
             raise ExternalServiceError(
-                f"head names {current.catalog_key} but it is not in the "
+                f"head names {current.payload_key} but it is not in the "
                 "catalog listing — refusing to sweep against a head that "
                 "cannot be verified"
             )
@@ -124,12 +124,12 @@ def _collect_locked(
     for key in listed:
         generation = _generation_of(key)
         if generation is None:
-            kept.append(key)  # unknown object under catalog/ — never touch
+            kept.append(key)  # unknown object under payload/ — never touch
             continue
         # The current generation is always kept, even if the window math
         # would exclude it; lost-CAS orphans share a generation number with
         # a retained winner and are kept until the window passes them.
-        if key == current.catalog_key or generation >= floor:
+        if key == current.payload_key or generation >= floor:
             kept.append(key)
             continue
         swept.append(key)

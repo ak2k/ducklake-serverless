@@ -2,7 +2,7 @@
 
 Every durable object is immutable and content-addressed. A commit is the
 creation of an immutable per-generation MARKER `roots/<gen>` (create-only)
-whose body is a `RootDoc`; the catalog it names lives at `catalog/<gen>-
+whose body is a `RootDoc`; the catalog it names lives at `payload/<gen>-
 <uuid>`. Both keys are derived from `(generation, uuid)` — never stored —
 so a key/body mismatch is unrepresentable. The only mutable object is the
 advisory `root-hint` (a `HintDoc`, a bare generation number), which no
@@ -21,10 +21,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ducklake_serverless.errors import InputValidationError
 
-CATALOG_PREFIX = "catalog/"
+PAYLOAD_PREFIX = "payload/"
 ROOTS_PREFIX = "roots/"
-_CATALOG_KEY_RE = re.compile(
-    r"^catalog/cat-(?P<gen>\d{8})-(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.duckdb$"
+_PAYLOAD_KEY_RE = re.compile(
+    r"^payload/(?P<gen>\d{8})-(?P<uuid>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
 )
 _MARKER_KEY_RE = re.compile(r"^roots/(?P<gen>\d{8})$")
 
@@ -44,17 +44,17 @@ def _check_generation(generation: int) -> None:
         )
 
 
-def format_catalog_key(generation: int, catalog_uuid: UUID) -> str:
-    """Canonical object key for a catalog generation."""
+def format_payload_key(generation: int, payload_uuid: UUID) -> str:
+    """Canonical object key for one generation's payload bytes."""
     _check_generation(generation)
-    return f"{CATALOG_PREFIX}cat-{generation:08d}-{catalog_uuid}.duckdb"
+    return f"{PAYLOAD_PREFIX}{generation:08d}-{payload_uuid}"
 
 
-def parse_catalog_key(key: str) -> tuple[int, UUID]:
-    """Inverse of `format_catalog_key`. Raises on any non-canonical key."""
-    m = _CATALOG_KEY_RE.match(key)
+def parse_payload_key(key: str) -> tuple[int, UUID]:
+    """Inverse of `format_payload_key`. Raises on any non-canonical key."""
+    m = _PAYLOAD_KEY_RE.match(key)
     if m is None:
-        raise InputValidationError(f"not a canonical catalog key: {key!r}")
+        raise InputValidationError(f"not a canonical payload key: {key!r}")
     return int(m.group("gen")), UUID(m.group("uuid"))
 
 
@@ -95,7 +95,7 @@ class RootDoc(BaseModel):
         default="ducklake-serverless-root/1", alias="schema"
     )
     generation: int = Field(ge=0, le=MAX_GENERATION)
-    catalog_uuid: UUID
+    payload_uuid: UUID
     created_at: datetime
     writer: WriterInfo
     # Adapter-supplied version tags (e.g. duckdb/ducklake versions) so a future
@@ -104,9 +104,9 @@ class RootDoc(BaseModel):
     pins: dict[str, str] = Field(default_factory=dict)
 
     @property
-    def catalog_key(self) -> str:
-        """Object key of the catalog generation this root names."""
-        return format_catalog_key(self.generation, self.catalog_uuid)
+    def payload_key(self) -> str:
+        """Object key of the payload bytes this generation names."""
+        return format_payload_key(self.generation, self.payload_uuid)
 
     @property
     def marker_key(self) -> str:
@@ -266,7 +266,7 @@ class CommitResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     generation: int
-    catalog_uuid: UUID
+    payload_uuid: UUID
     attempts: int
 
 

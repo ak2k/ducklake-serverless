@@ -43,7 +43,7 @@ from ducklake_serverless.models import (
     Replay,
     RootDoc,
     WriterInfo,
-    format_catalog_key,
+    format_payload_key,
 )
 from ducklake_serverless.objectstore import probe_atomic_create, probe_capabilities
 from ducklake_serverless.root import (
@@ -190,7 +190,7 @@ def _advance(
     new_doc = phase.base.model_copy(
         update={
             "generation": target,
-            "catalog_uuid": new_uuid,
+            "payload_uuid": new_uuid,
             "created_at": datetime.now(tz=UTC),
             "writer": writer_info(),
         }
@@ -220,7 +220,7 @@ def _publish_resolved(
     with one GET: present means it landed. Returns False when the upload
     definitively did not land (caller retries with backoff).
     """
-    key = format_catalog_key(generation, new_uuid)
+    key = format_payload_key(generation, new_uuid)
     try:
         store.put_if_absent(key, work.read_bytes())
     except AmbiguousCasError:
@@ -282,7 +282,7 @@ def _try_create_marker(
         case MarkerOutcome.WON:
             write_hint(store, new_doc.generation)
             return CommitResult(
-                generation=new_doc.generation, catalog_uuid=new_uuid, attempts=attempt + 1
+                generation=new_doc.generation, payload_uuid=new_uuid, attempts=attempt + 1
             )
         case MarkerOutcome.LOST:
             return None

@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from ducklake_serverless import commit
-from ducklake_serverless.models import Abort, RootDoc, format_catalog_key
+from ducklake_serverless.models import Abort, RootDoc, format_payload_key
 from ducklake_serverless.root import MarkerOutcome, read_marker, resolve_head, write_hint
 
 if TYPE_CHECKING:
@@ -63,10 +63,10 @@ class BlobStore:
         if verify_backend:
             commit.require_atomic_create(self._store)
         blob_uuid = uuid4()
-        self._store.put_if_absent(format_catalog_key(0, blob_uuid), initial)
+        self._store.put_if_absent(format_payload_key(0, blob_uuid), initial)
         doc = RootDoc(
             generation=0,
-            catalog_uuid=blob_uuid,
+            payload_uuid=blob_uuid,
             created_at=datetime.now(tz=UTC),
             writer=commit.writer_info(),
         )
@@ -87,7 +87,7 @@ class BlobStore:
     def read(self) -> bytes:
         """The current generation's bytes."""
         base, _ = resolve_head(self._store)
-        return self._store.get(base.catalog_key).body
+        return self._store.get(base.payload_key).body
 
     def write(self, data: bytes) -> CommitResult:
         """Commit `data` wholesale as the next generation.

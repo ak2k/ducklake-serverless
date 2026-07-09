@@ -17,7 +17,7 @@ from uuid import uuid4
 
 from ducklake_serverless.engine import MAGIC, MAGIC_OFFSET
 from ducklake_serverless.errors import CatalogHygieneError
-from ducklake_serverless.models import format_catalog_key
+from ducklake_serverless.models import format_payload_key
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -48,13 +48,13 @@ class GenerationCache:
         self._workdir = workdir
         self._pristine: OrderedDict[str, Path] = OrderedDict()
 
-    def fetch_copy(self, generation: int, catalog_uuid: UUID) -> Path:
+    def fetch_copy(self, generation: int, payload_uuid: UUID) -> Path:
         """Return a private, mutable copy of the given generation's catalog."""
-        key = format_catalog_key(generation, catalog_uuid)
+        key = format_payload_key(generation, payload_uuid)
         pristine = self._pristine.get(key)
         if pristine is None or not pristine.exists():
             result = self._store.get(key)
-            pristine = self._workdir / f"pristine-{generation:08d}-{catalog_uuid}.duckdb"
+            pristine = self._workdir / f"pristine-{generation:08d}-{payload_uuid}.duckdb"
             pristine.write_bytes(result.body)
             self._pristine[key] = pristine
         self._pristine.move_to_end(key)
@@ -93,7 +93,7 @@ def check_hygiene(catalog_path: Path) -> None:
 
 
 def publish_generation(
-    store: ObjectStore, catalog_path: Path, generation: int, catalog_uuid: UUID
+    store: ObjectStore, catalog_path: Path, generation: int, payload_uuid: UUID
 ) -> str:
     """Hygiene-check and upload a new catalog generation (create-only).
 
@@ -101,5 +101,5 @@ def publish_generation(
     never a root pointing at a missing or dirty catalog.
     """
     check_hygiene(catalog_path)
-    key = format_catalog_key(generation, catalog_uuid)
+    key = format_payload_key(generation, payload_uuid)
     return store.put_if_absent(key, catalog_path.read_bytes())
