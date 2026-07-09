@@ -1,4 +1,4 @@
-"""Model invariants: catalog-key derivation is total and round-trips."""
+"""Model invariants: payload-key derivation is total and round-trips."""
 
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ from ducklake_serverless.models import (
     HintDoc,
     RootDoc,
     WriterInfo,
-    format_payload_key,
     format_marker_key,
-    parse_payload_key,
+    format_payload_key,
     parse_marker_key,
+    parse_payload_key,
 )
 
 
