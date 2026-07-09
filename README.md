@@ -9,9 +9,8 @@ included — living in one bucket.
 
 > Status: early development, never deployed. Commit protocol, transaction
 > envelope, rebase-on-conflict, GC, and DuckLake data-plane maintenance are
-> implemented and tested — hermetically, against MinIO and SeaweedFS in CI, and
-> live against iDrive E2. Not affiliated with DuckDB Labs or the DuckLake
-> project.
+> implemented and tested — hermetically, and against real MinIO and SeaweedFS
+> backends in CI. Not affiliated with DuckDB Labs or the DuckLake project.
 
 ## The idea
 
@@ -29,9 +28,11 @@ Postgres, no lock service, no sidecar:
   the marker you tried to create — *exact and permanent*, so "did my commit
   land?" is never the caller's problem to reconcile.
 
-The serialization point is the S3 conditional write itself — supported by AWS S3
-(since 2024), GCS, Azure, R2, MinIO, and iDrive E2 (verified empirically).
-Writers can be Lambdas.
+The serialization point is the S3 conditional write itself. **AWS S3 (since
+2024), MinIO, and SeaweedFS are verified — empirically raced in CI — to enforce
+it atomically under concurrency.** GCS, Azure, and R2 document the primitive but
+have not been raced here, so probe them before you trust an endpoint. Writers on
+an atomic backend can be Lambdas.
 
 **Verify your endpoint before trusting it**: some S3-compatible stores accept
 `If-None-Match` without enforcing it, and some enforce it only sequentially
