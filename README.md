@@ -1,74 +1,82 @@
 # ducklake-serverless
 
-**Multi-writer [DuckLake](https://ducklake.select/) with no catalog server — the
-entire lakehouse, catalog included, lives in one object-storage bucket.**
+**A serverless, versioned, ACID object store on plain S3 — no metadata server.**
+Any payload (a file, a DuckDB/SQLite database, an arbitrary artifact) gets
+atomic compare-and-swap versioning, time travel, and concurrent-safe commits,
+using only S3 conditional writes. [DuckLake](https://ducklake.select/) is the
+flagship adapter: multi-writer DuckLake with the whole lakehouse — catalog
+included — living in one bucket.
 
-> Status: early development, functionally complete. Commit protocol,
-> transaction envelope, rebase-on-conflict, catalog GC, and data-plane
-> maintenance (snapshot expiry + orphan-Parquet cleanup) are implemented
-> and tested — hermetically, against MinIO and SeaweedFS in CI, and live
-> against iDrive E2. Not affiliated with DuckDB Labs or the DuckLake
+> Status: early development, never deployed. Commit protocol, transaction
+> envelope, rebase-on-conflict, GC, and DuckLake data-plane maintenance are
+> implemented and tested — hermetically, against MinIO and SeaweedFS in CI, and
+> live against iDrive E2. Not affiliated with DuckDB Labs or the DuckLake
 > project.
 
 ## The idea
 
-DuckLake's design puts lakehouse metadata in a SQL database. That database is
-the one component that needs a running server — Postgres for multi-writer, or
-a local DuckDB file for single-user. This library removes the server:
+A mutable, versioned artifact lives entirely in an object-storage prefix — no
+Postgres, no lock service, no sidecar:
 
-- The **entire catalog is an immutable, versioned DuckDB file** in the bucket
-  (`catalog/cat-<generation>-<uuid>.duckdb`) — each generation is a complete,
-  stock DuckLake catalog readable by any DuckLake-aware tool.
-- Each commit **creates one immutable generation marker** `roots/<generation>`
-  (Delta-log-shaped) — a create-only PUT (`If-None-Match: *`) whose body names
-  that generation's catalog. Exactly one writer wins each generation; the
-  marker is never overwritten and never deleted. A tiny mutable `root-hint`
-  points at roughly the latest generation, purely to save readers a few probes.
-- Commits are **create-only compare-and-swap**: stage everything (Parquet +
-  next catalog), then create the next marker. Losers rebase onto the current
-  head and retry. Crucially, an ambiguous outcome (a timeout) is resolved by
-  one GET of the marker you tried to create — *exact and permanent*, so "did my
-  commit land?" never becomes the caller's problem to reconcile.
-- Readers need zero custom code: resolve the head marker, then
-  `ATTACH 'ducklake:…' (READ_ONLY)` — the official frozen-DuckLake pattern.
+- Each generation's **bytes are one immutable object** at `payload/<gen>-<uuid>`.
+- Each commit **creates one immutable generation marker** `roots/<gen>` — a
+  create-only PUT (`If-None-Match: *`) whose body names that generation's
+  payload. Exactly one writer wins each generation; the marker is never
+  overwritten or deleted. A tiny mutable `root-hint` points at roughly the
+  latest generation, purely to save readers a few probes.
+- Commits are **create-only compare-and-swap**: stage the payload, then create
+  the next marker. An ambiguous outcome (a timeout) is resolved by one GET of
+  the marker you tried to create — *exact and permanent*, so "did my commit
+  land?" is never the caller's problem to reconcile.
 
-No sidecar, no epoch holder, no failover story, no lock service. Writers can
-be Lambdas. The serialization point is the S3 conditional write itself —
-supported by AWS S3 (since 2024), GCS, Azure, R2, MinIO, and iDrive E2
-(verified empirically). Because commits are create-only, they depend only on
-`If-None-Match` — the more widely-implemented half of the primitive.
+The serialization point is the S3 conditional write itself — supported by AWS S3
+(since 2024), GCS, Azure, R2, MinIO, and iDrive E2 (verified empirically).
+Writers can be Lambdas.
 
-**Verify your endpoint before trusting it**: some S3-compatible stores
-accept `If-Match`/`If-None-Match` headers without enforcing them, and some
-enforce them only sequentially (fine for one writer, silently lossy under
-concurrent ones) — either would corrupt a lake with zero errors. See the
-[live-tested compatibility table](docs/compatibility.md) — re-verified
-weekly in CI and on every backend version bump, so it cannot go stale.
-`verify_conditional_writes(store)` checks sequential enforcement in one
-round-trip (the integration lane runs it automatically);
-`probe_capabilities(store)` races concurrent writers to check *atomic*
-enforcement, and `Lake.bootstrap()` gates on it — refusing any backend
-whose create-only isn't atomic under concurrency.
+**Verify your endpoint before trusting it**: some S3-compatible stores accept
+`If-None-Match` without enforcing it, and some enforce it only sequentially
+(fine for one writer, silently lossy under concurrent ones) — either would
+corrupt a store with zero errors. See the
+[live-tested compatibility table](docs/compatibility.md) (re-verified weekly in
+CI). `probe_capabilities(store)` races concurrent writers to check *atomic*
+enforcement, and `bootstrap()` gates on it — refusing any backend whose
+create-only isn't atomic under concurrency (pass `verify_backend=False` for a
+deliberately single-writer store).
 
-## Concurrency semantics
+## Architecture: engine + adapters
 
-Same deal as Delta Lake and Iceberg's optimistic concurrency, applied to the
-DuckLake format:
+The commit/marker/CAS/lease/GC machinery is **payload-agnostic** — it moves
+bytes and never imports `duckdb`. A `Payload`/`CommitContext` adapter teaches
+it the few payload-specific things it needs (pre-publish validation, version
+pins, and — for a mergeable payload — how to rebase). This split is enforced by
+a test that imports every engine-core module in a fresh interpreter and asserts
+`duckdb` was never pulled in.
 
-- **Blind appends** (`INSERT … VALUES`, `INSERT … SELECT` over non-lake
-  sources such as staged Parquet) rebase and retry automatically — concurrent
-  appenders never see conflicts.
-- **State-dependent DML** (`UPDATE`, `DELETE`, lake-reading inserts) aborts
-  cleanly when it loses a race; the application re-reads and re-decides.
-  Re-executing such SQL against state the writer never observed is write skew,
-  so it is opt-in (`replay_all`), never the default.
-- **DDL** conflicts always abort. Run migrations from one place.
+- **`BlobStore`** — the general-purpose adapter. Any bytes, versioned. A lost
+  commit race aborts (a blob can't be merged); re-read and re-write.
+- **`Lake`** (DuckLake) — the flagship adapter. Full DuckLake catalog with SQL
+  transactions, blind-append rebase-on-conflict, and DuckDB/DuckLake version
+  pinning. Each generation is a complete, stock DuckLake catalog readable by any
+  DuckLake-aware tool via `ATTACH 'ducklake:…' (READ_ONLY)`.
 
-Each marker also pins the DuckDB storage version and DuckLake format version:
-a writer with mismatched local versions refuses to commit rather than silently
-auto-migrating the catalog for the whole fleet. Upgrades are explicit.
+## Usage — BlobStore (any payload)
 
-## Usage
+```python
+from pathlib import Path
+from ducklake_serverless.objectstore import S3ObjectStore, make_s3_client
+from ducklake_serverless.blob import BlobStore
+
+client = make_s3_client(endpoint_url="https://<s3-compatible-endpoint>")
+store = S3ObjectStore(client, "my-bucket", prefix="artifact")
+bs = BlobStore(store, workdir=Path("/tmp/blob-work"))
+
+bs.bootstrap(b"v0")            # once: generation 0
+bs.write(b"v1")                # commit the next generation (aborts on a lost race)
+assert bs.read() == b"v1"      # current bytes
+bs.head().generation           # 1
+```
+
+## Usage — DuckLake
 
 ```python
 from pathlib import Path
@@ -79,22 +87,24 @@ client = make_s3_client(endpoint_url="https://<s3-compatible-endpoint>")
 store = S3ObjectStore(client, "my-bucket", prefix="lake")
 lake = Lake(store, workdir=Path("/tmp/lake-work"), data_path="s3://my-bucket/lake/data")
 
-lake.bootstrap()                       # once, creates generation 0 + its marker
+lake.bootstrap()                       # once: generation 0 + its marker
 
 with lake.transaction() as tx:         # concurrent writers just do this
     tx.sql("CREATE TABLE events (id INTEGER, msg VARCHAR)")
-
 with lake.transaction() as tx:
     tx.sql("INSERT INTO events VALUES (?, ?)", (1, "hello"))
 
-with lake.reader() as con:             # readers: stock frozen-DuckLake attach
+with lake.reader() as con:             # stock frozen-DuckLake attach
     print(con.execute("SELECT * FROM events"))
 ```
 
+DuckLake concurrency (optimistic, Delta/Iceberg-style): **blind appends** rebase
+and retry automatically; **state-dependent DML** (`UPDATE`/`DELETE`/lake-reading
+inserts) aborts on a lost race (re-executing it against unobserved state is
+write skew, so replay is opt-in via `replay_all`); **DDL** always aborts.
+
 Always create S3 clients with `make_s3_client` — it disables botocore's
-transport retries. With immutable markers a self-412 from an SDK retry
-resolves cleanly as WON, but disabling retries keeps the resolution path
-simple.
+transport retries so the create-only resolution path stays simple.
 
 ## Development
 
@@ -103,9 +113,5 @@ uv sync
 make check   # ruff + basedpyright strict + pytest (moto CAS conformance included)
 ```
 
-The test suite includes conformance guards asserting that the S3 fake (moto)
-actually enforces conditional-write semantics — if those regress, concurrency
-tests fail loudly instead of becoming vacuous.
-
-See `AGENTS.md` for the contribution contract and the protocol invariants
-that must not be weakened.
+See `AGENTS.md` for the contribution contract and protocol invariants, and
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for what's planned and deliberately deferred.
