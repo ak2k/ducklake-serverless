@@ -27,7 +27,6 @@ from ducklake_serverless.engine import (
     probe_ducklake_format_version,
 )
 from ducklake_serverless.errors import (
-    BackendUnsafeError,
     ExternalServiceError,
     ObjectNotFoundError,
     VersionMismatchError,
@@ -41,11 +40,7 @@ from ducklake_serverless.models import (
     Statement,
     format_catalog_key,
 )
-from ducklake_serverless.objectstore import (
-    S3ObjectStore,
-    probe_atomic_create,
-    probe_capabilities,
-)
+from ducklake_serverless.objectstore import S3ObjectStore
 from ducklake_serverless.rebase import decide_rebase
 from ducklake_serverless.recorder import record
 from ducklake_serverless.root import (
@@ -155,21 +150,6 @@ class Lake:
         self._max_attempts = max_attempts
         self._s3_credentials = s3_credentials
 
-    def _require_atomic_create(self) -> None:
-        """Refuse a backend whose create-only isn't atomic under concurrency."""
-        if not probe_atomic_create(self._store):
-            # Re-probe the full set only to enrich the refusal diagnostic; the
-            # happy path above pays for a single contention round, not two.
-            caps = probe_capabilities(self._store)
-            raise BackendUnsafeError(
-                "backend does not enforce If-None-Match: * atomically under "
-                "concurrency (concurrent create-only PUTs all 'win', silently "
-                "losing commits) — it cannot serialize a marker-protocol lake. "
-                f"Probed capabilities: {caps}. Use an atomic backend (MinIO, "
-                "AWS S3, SeaweedFS) for concurrent writers, or "
-                "bootstrap(verify_backend=False) for a single-writer lake."
-            )
-
     def bootstrap(self, *, verify_backend: bool = True) -> RootDoc:
         """Create generation 0 (an empty DuckLake catalog) and its marker.
 
@@ -187,7 +167,7 @@ class Lake:
         needs it — E2 enforces neither primitive atomically.)
         """
         if verify_backend:
-            self._require_atomic_create()
+            commit.require_atomic_create(self._store)
         catalog_uuid = uuid4()
         catalog_path = self._workdir / f"bootstrap-{catalog_uuid}.duckdb"
         connection = LakeConnection(

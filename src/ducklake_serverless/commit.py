@@ -30,6 +30,7 @@ from uuid import UUID, uuid4
 from ducklake_serverless import __version__
 from ducklake_serverless.errors import (
     AmbiguousCasError,
+    BackendUnsafeError,
     ConditionalConflictError,
     ConflictAbortError,
     ExternalServiceError,
@@ -44,6 +45,7 @@ from ducklake_serverless.models import (
     WriterInfo,
     format_catalog_key,
 )
+from ducklake_serverless.objectstore import probe_atomic_create, probe_capabilities
 from ducklake_serverless.root import (
     MarkerOutcome,
     create_marker,
@@ -96,6 +98,28 @@ class CommitContext(Protocol):
 def writer_info() -> WriterInfo:
     """Provenance for the writer publishing a generation."""
     return WriterInfo(lib_version=__version__, host=socket.gethostname(), pid=os.getpid())
+
+
+def require_atomic_create(store: ObjectStore) -> None:
+    """Refuse a backend whose create-only isn't atomic under concurrency.
+
+    The marker protocol serializes commits on `If-None-Match: *`, so a store
+    that resolves concurrent creates last-writer-wins (iDrive E2, garage,
+    `rclone serve s3`) would silently lose commits. Callers may skip this for a
+    single-writer lake where no concurrent create can occur.
+    """
+    if not probe_atomic_create(store):
+        # Re-probe the full set only to enrich the refusal diagnostic; the happy
+        # path above pays for a single contention round, not two.
+        caps = probe_capabilities(store)
+        raise BackendUnsafeError(
+            "backend does not enforce If-None-Match: * atomically under "
+            "concurrency (concurrent create-only PUTs all 'win', silently "
+            "losing commits) — it cannot serialize a marker-protocol lake. "
+            f"Probed capabilities: {caps}. Use an atomic backend (MinIO, "
+            "AWS S3, SeaweedFS) for concurrent writers, or "
+            "verify_backend=False for a single-writer lake."
+        )
 
 
 def _backoff(attempt: int) -> None:
