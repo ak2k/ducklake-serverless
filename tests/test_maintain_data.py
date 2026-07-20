@@ -12,7 +12,7 @@ from ducklake_serverless.errors import ConflictAbortError, InputValidationError
 from ducklake_serverless.gc import maintain_data
 from ducklake_serverless.lease import Lease
 from ducklake_serverless.models import ROOTS_PREFIX
-from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore
+from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore, ObjectMeta
 from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 from tests.conftest import lake_churn as churn
@@ -254,6 +254,12 @@ def test_lost_cas_after_physical_deletes_stays_consistent(
 
         def list_prefix(self, prefix: str) -> list[str]:
             return self._inner.list_prefix(prefix)
+
+        def list_meta(self, prefix: str) -> list[ObjectMeta]:
+            return self._inner.list_meta(prefix)
+
+        def head_meta(self, key: str) -> ObjectMeta:
+            return self._inner.head_meta(key)
 
         def put(self, key: str, body: bytes) -> str:
             return self._inner.put(key, body)

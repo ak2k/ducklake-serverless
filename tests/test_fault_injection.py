@@ -17,7 +17,7 @@ from ducklake_serverless.errors import (
     VersionMismatchError,
 )
 from ducklake_serverless.models import ROOTS_PREFIX
-from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore
+from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore, ObjectMeta
 from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 
@@ -61,6 +61,14 @@ class AmbiguousMarkerStore:
     def list_prefix(self, prefix: str) -> list[str]:
         """Delegate."""
         return self._inner.list_prefix(prefix)
+
+    def list_meta(self, prefix: str) -> list[ObjectMeta]:
+        """Delegate."""
+        return self._inner.list_meta(prefix)
+
+    def head_meta(self, key: str) -> ObjectMeta:
+        """Delegate."""
+        return self._inner.head_meta(key)
 
     def delete(self, key: str) -> None:
         """Delegate."""

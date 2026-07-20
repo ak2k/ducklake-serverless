@@ -379,7 +379,7 @@ class Lake:
             return store
         base, _ = resolve_head(store)  # auto: only stream a large catalog
         key = format_payload_key(base.generation, base.payload_uuid)
-        return store if store.size(key) >= STREAM_MIN_BYTES else None
+        return store if store.head_meta(key).size >= STREAM_MIN_BYTES else None
 
     def _open_streaming_reader(self, store: S3ObjectStore) -> LakeConnection:
         """Attach the current head's catalog directly from S3 (httpfs), no download.

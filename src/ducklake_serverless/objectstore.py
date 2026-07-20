@@ -65,6 +65,21 @@ class GetResult:
     last_modified: datetime | None = None
 
 
+@dataclass(frozen=True)
+class ObjectMeta:
+    """An object's metadata without its body — one HEAD or one listing row.
+
+    `last_modified` is the STORE's clock (see `GetResult`). The pack GC's
+    age gate is a cross-clock comparison, so it must only ever compare
+    these timestamps against other store-issued timestamps, never against
+    the runner's clock.
+    """
+
+    key: str
+    size: int
+    last_modified: datetime | None = None
+
+
 class ObjectStore(Protocol):
     """Minimal store surface the protocol needs; S3 and in-memory fakes satisfy it."""
 
@@ -86,6 +101,14 @@ class ObjectStore(Protocol):
 
     def list_prefix(self, prefix: str) -> list[str]:
         """List keys under a prefix."""
+        ...
+
+    def list_meta(self, prefix: str) -> list[ObjectMeta]:
+        """List objects under a prefix with size + store-clock mtime."""
+        ...
+
+    def head_meta(self, key: str) -> ObjectMeta:
+        """One object's metadata without its body; ObjectNotFoundError if absent."""
         ...
 
     def delete(self, key: str) -> None:
@@ -186,6 +209,26 @@ class S3ObjectStore:
             raise ExternalServiceError(f"list {prefix!r}") from exc
         return keys
 
+    def list_meta(self, prefix: str) -> list[ObjectMeta]:
+        """List objects under a prefix with size + LastModified (store clock)."""
+        metas: list[ObjectMeta] = []
+        paginator = self._client.get_paginator("list_objects_v2")
+        try:
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=self._full(prefix)):
+                for obj in page.get("Contents", []):
+                    key = obj.get("Key")
+                    if key is not None:
+                        metas.append(
+                            ObjectMeta(
+                                key=key.removeprefix(self._prefix),
+                                size=int(obj.get("Size", 0)),
+                                last_modified=obj.get("LastModified"),
+                            )
+                        )
+        except botocore.exceptions.ClientError as exc:
+            raise ExternalServiceError(f"list_meta {prefix!r}") from exc
+        return metas
+
     def delete(self, key: str) -> None:
         """Delete an object (idempotent)."""
         try:
@@ -193,11 +236,11 @@ class S3ObjectStore:
         except botocore.exceptions.ClientError as exc:
             raise ExternalServiceError(f"delete {key!r}") from exc
 
-    def size(self, key: str) -> int:
-        """Object size in bytes via a HEAD — no body transfer.
+    def head_meta(self, key: str) -> ObjectMeta:
+        """Object metadata via a HEAD — no body transfer.
 
-        Used by the streaming reader's `auto` heuristic to decide whether a
-        catalog is large enough that httpfs range-reads beat a full download.
+        Serves the streaming reader's `auto` size heuristic and the pack GC's
+        pre-delete age recheck.
         """
         try:
             resp = self._client.head_object(Bucket=self._bucket, Key=self._full(key))
@@ -205,7 +248,11 @@ class S3ObjectStore:
             if _error_code(exc) in ("NoSuchKey", "404") or _status(exc) == HTTPStatus.NOT_FOUND:
                 raise ObjectNotFoundError(key) from exc
             raise ExternalServiceError(f"head {key!r}") from exc
-        return int(resp["ContentLength"])
+        return ObjectMeta(
+            key=key,
+            size=int(resp["ContentLength"]),
+            last_modified=resp.get("LastModified"),
+        )
 
     def s3_uri(self, key: str) -> str:
         """The `s3://…` URI DuckDB httpfs can ATTACH directly (streaming reads)."""
@@ -447,6 +494,24 @@ class InMemoryObjectStore:
         """List keys under a prefix, sorted for determinism."""
         with self._lock:
             return sorted(k for k in self._objects if k.startswith(prefix))
+
+    def list_meta(self, prefix: str) -> list[ObjectMeta]:
+        """List objects under a prefix with size + write time, key-sorted."""
+        with self._lock:
+            return [
+                ObjectMeta(key=k, size=len(body), last_modified=written)
+                for k, (body, _, written) in sorted(self._objects.items())
+                if k.startswith(prefix)
+            ]
+
+    def head_meta(self, key: str) -> ObjectMeta:
+        """Object metadata without its body; ObjectNotFoundError if absent."""
+        with self._lock:
+            try:
+                body, _, written = self._objects[key]
+            except KeyError:
+                raise ObjectNotFoundError(key) from None
+            return ObjectMeta(key=key, size=len(body), last_modified=written)
 
     def delete(self, key: str) -> None:
         """Delete an object (idempotent)."""
