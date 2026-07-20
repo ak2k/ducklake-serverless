@@ -312,10 +312,15 @@ def test_corrupt_manifest_omitted_from_ls_not_poisoning(tmp_path: Path) -> None:
     gen1_key = sorted(store.list_prefix("payload/"))[1]
     store.put(gen1_key, b"garbage that is not a manifest")
 
-    names = fs_names = GenerationFileSystem(store).ls("gen", detail=False)
-    assert "gen/2" in names  # healthy generations still listed
-    assert "gen/1" not in names  # corrupt one omitted, no exception
-    assert fs_names == names
+    fs = GenerationFileSystem(store)
+    names = fs.ls("gen", detail=False)
+    # Listing is MARKER-ONLY (payload_size lives in the marker), so the
+    # corrupt generation still lists — and crucially the listing never
+    # raises. Corruption surfaces loudly at open/read time instead.
+    assert names == ["gen/0", "gen/1", "gen/2"]
+    assert [e["name"] for e in fs.ls("gen")] == names  # detail mode agrees
+    with pytest.raises(ExternalServiceError), fs.open("gen/1", "rb") as f:
+        f.read()  # the corrupt manifest fails HERE, not in ls
 
 
 def test_two_stores_two_filesystems_never_alias(tmp_path: Path) -> None:
@@ -366,12 +371,15 @@ def test_reader_memo_avoids_repeat_manifest_fetch(tmp_path: Path) -> None:
     store.reset_counts()
     fs.info(pinned)
     manifest_gets_after_info = len([k for k in store.full_gets if k.startswith("payload/")])
+    assert manifest_gets_after_info == 0  # info is marker-only: NO manifest fetch
     with fs.open(pinned, "rb", cache_type="none") as f:
         f.seek(1000)
         f.read(10)
+    with fs.open(pinned, "rb", cache_type="none") as f:
+        f.seek(5000)
+        f.read(10)
     manifest_gets_total = len([k for k in store.full_gets if k.startswith("payload/")])
-    assert manifest_gets_after_info == 1
-    assert manifest_gets_total == 1  # memoized reader: no second fetch
+    assert manifest_gets_total == 1  # memoized reader: ONE fetch across opens
 
 
 def payload_bytes(seed: int, size: int = 50_000) -> bytes:

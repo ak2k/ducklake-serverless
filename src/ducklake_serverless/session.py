@@ -416,8 +416,8 @@ class Lake:
             return None  # auto on a chunked head → download (reconstruct)
         if stream is True:
             return store
-        key = format_payload_key(base.generation, base.payload_uuid)
-        return store if store.head_meta(key).size >= STREAM_MIN_BYTES else None
+        # Marker-recorded size: no HEAD round trip for the auto heuristic.
+        return store if base.payload_size >= STREAM_MIN_BYTES else None
 
     def _open_streaming_reader(self, store: S3ObjectStore) -> LakeConnection:
         """Attach the current head's catalog directly from S3 (httpfs), no download.

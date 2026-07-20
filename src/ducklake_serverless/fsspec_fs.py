@@ -306,6 +306,11 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
                 reader = _reader_for(self._store, doc)
             except NotFoundError as exc:  # payload swept (generation aged out)
                 raise FileNotFoundError(doc.payload_key) from exc
+            except InputValidationError as exc:  # unparseable/oversized manifest
+                raise ExternalServiceError(
+                    f"{doc.payload_key}: committed chunked generation has an "
+                    "unreadable manifest — corrupt payload object"
+                ) from exc
             self._readers[doc.payload_key] = reader
         return reader
 
@@ -349,7 +354,8 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         doc = self._resolve(path)
         return {
             "name": name,
-            "size": self._reader(doc).size,
+            # Marker-recorded size: listings never fetch payloads/manifests.
+            "size": doc.payload_size,
             "type": "file",
             "generation": doc.generation,
             "transport": doc.transport,

@@ -107,6 +107,13 @@ class RootDoc(BaseModel):
     # this, never on content sniffing. Set explicitly per commit from the
     # publish outcome — NEVER inherited from the base generation's marker.
     transport: Literal["whole", "chunked"] = "whole"
+    # Logical payload size in bytes, recorded at commit time (immutable, like
+    # everything else in the marker). METADATA, not a read gate: listings and
+    # heuristics read it marker-only instead of fetching the payload/manifest;
+    # reads still derive truth from the payload itself (sha-verified), and a
+    # disagreement is a corruption signal. Derived from the publish outcome,
+    # never inherited.
+    payload_size: int = Field(default=0, ge=0)
 
     @property
     def payload_key(self) -> str:
