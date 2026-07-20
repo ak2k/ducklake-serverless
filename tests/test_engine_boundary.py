@@ -19,6 +19,7 @@ import pytest
 # (DuckLake's engine.py/session.py/recorder.py/generation.py legitimately import
 # duckdb and are excluded.)
 ENGINE_CORE = [
+    "chunk",
     "commit",
     "blob",
     "models",
