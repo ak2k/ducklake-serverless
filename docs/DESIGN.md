@@ -105,12 +105,12 @@ Availability-side by construction; revisit triggers noted.
   (stall > 2× grace) ∧ (ms-race) — strictly stronger than grace-only
   systems (Delta VACUUM, Iceberg remove_orphan_files, restic), which lose
   on stall > grace alone. Verified against SOTA 2026-07.
-- **Heal path is single-attempt.** `verify_packs`' refresh-PUT has no
-  retry/ambiguity loop; one transient transport failure aborts the whole
-  commit loudly (nothing published, caller retries). Retrying an
-  UNCONDITIONAL put has no clean did-it-land resolution, so the loop would
-  add complexity for a reliability nicety. Revisit if writers run over
-  genuinely flaky transport (e.g. Lambdas on a lossy path).
+- **Heal path retries transients, bounded.** `verify_packs`' refresh-PUT
+  retries transient transport failures up to `_REFRESH_PUT_ATTEMPTS`
+  (matching `put_pack`'s budget — the create-only heal it replaced retried
+  too). An unconditional PUT needs no did-it-land resolution, so blind
+  retry is safe; a persistent failure still aborts the whole commit loudly
+  (nothing published, caller retries).
 - **HEAD-then-GET size-cap TOCTOU.** An out-of-band writer swapping an
   object between the size HEAD and the GET defeats the manifest size cap
   → one unbounded GET (memory pressure), then parse failure → RefuseSweep.

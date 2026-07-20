@@ -1,31 +1,36 @@
 # Roadmap
 
 Planned and deliberately deferred work. The engine/adapter split (payload-
-agnostic engine + `BlobStore` + DuckLake `Lake`) is done and boundary-locked;
-everything below is additive.
+agnostic engine + `BlobStore` + DuckLake `Lake`) and the chunked /
+content-addressed transport (fixed-offset chunks + ~8 MiB packs, two-cycle
+pack GC — see [`DESIGN.md`](DESIGN.md)) are done; everything below is
+additive.
 
-## Deferred — chunked / content-addressed storage
+## Done — chunked / content-addressed storage (2026-07, `work-19437`)
 
-Replace the whole-file-per-generation transport with content-addressed
-**fixed-offset chunks + ~8 MB packs + a per-generation manifest**, deduped
-against the base generation's manifest, reconstructed by parallel pack fetch.
+Implemented as designed: fixed-offset chunks (64 KiB default, entry-capped
+scaling) + ~8 MiB content-addressed packs + a per-generation manifest,
+deduped strictly against the base manifest, windowed parallel reconstruct,
+threshold-gated per adapter (`chunk_threshold`; whole-file remains below it
+and keeps the httpfs streaming reader — the keep-both fork was resolved by
+the threshold). Pack GC is a two-cycle tombstone mark-sweep with a fenced
+ledger; invariants and accepted residuals in [`DESIGN.md`](DESIGN.md).
 
-- **Why deferred:** measured — DuckLake catalogs stay ~5–6 MB unless data
-  inlining is on, so chunking is marginal for the DuckLake adapter today; and it
-  breaks the httpfs streaming reader (a generation would no longer be a single
-  attachable object). Revisit when a real large-payload workload exists (an
-  inlined catalog, or a large `BlobStore` blob).
-- **Measured payoff (real E2, ~40 ms RTT, 42 MB payload):** whole-file cold open
-  ~2 s and O(size) per commit → chunks+packs ~700 ms cold open, ~30× smaller
-  per-commit upload/storage. Fixed-offset beat content-defined chunking (DuckDB
-  keeps block offsets stable across checkpoints). Serial chunk fetch is a hard
-  cliff (~96 s at 16 KB/42 MB) — reconstruct **must** be parallel
-  (`ThreadPoolExecutor`; do NOT switch to aiobotocore — packing keeps object
-  counts low, so threads suffice).
-- **Design decision needed first:** chunk-and-retire-streaming vs keep-both
-  transports (see the "Step 2 transport" fork).
-- Scratch benchmarks live outside this repo: `catalog_chunk_probe.py`,
-  `attach_bench.py` (measure dedup and cold-open against a real catalog/MinIO/E2).
+Residue worth keeping here:
+
+- **Measured payoff (real E2, ~40 ms RTT, 42 MB payload):** whole-file cold
+  open ~2 s and O(size) per commit → chunks+packs ~700 ms cold open, ~30×
+  smaller per-commit upload/storage. Fixed-offset beat content-defined
+  chunking (DuckDB keeps block offsets stable). Serial fetch is a cliff
+  (~96 s) — reconstruct is windowed-parallel (`ThreadPoolExecutor`; NOT
+  aiobotocore — packing keeps object counts low, threads suffice).
+- Scratch benchmarks (outside this repo): `catalog_chunk_probe.py`,
+  `attach_bench.py` — rerun the shape against the REAL implementation when
+  tuning `chunk_threshold` / `DEFAULT_PACK_TARGET` for a workload.
+- Possible follow-ups, demand-gated: pack repack/compaction (partially-dead
+  packs currently retain until fully unreferenced), heal-path retry for
+  flaky-transport writers (see DESIGN.md residuals), pack compression via
+  the manifest's `compression` field.
 
 ## Deferred — physical `core/` + `adapters/` reorg
 
