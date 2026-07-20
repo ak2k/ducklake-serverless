@@ -45,8 +45,16 @@ from ducklake_serverless.errors import (
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
+    from typing import BinaryIO, Protocol
 
     from ducklake_serverless.objectstore import ObjectStore
+
+    class HashLike(Protocol):
+        """The slice of hashlib's hash-object API the reconstructor uses."""
+
+        def update(self, data: bytes, /) -> None: ...  # noqa: D102
+        def hexdigest(self) -> str: ...  # noqa: D102
+
 
 PACKS_PREFIX = "packs/"
 
@@ -295,34 +303,56 @@ def publish_packs(
 def verify_packs(
     store: ObjectStore, manifest: Manifest, novel: dict[str, bytes], *, max_workers: int = 8
 ) -> None:
-    """HEAD every referenced pack right before the manifest PUT; heal novel ones.
+    """Verify every referenced pack right before the manifest PUT; heal novel ones.
 
-    The stalled-writer defense: a writer that stalled past the GC grace may
-    have had its not-yet-referenced packs swept. Immediately before the
-    manifest lands (after which the mark pass protects them), re-HEAD every
-    pack — re-PUT any missing one we hold bytes for (create-only, idempotent),
-    and fail loudly if a missing pack came from the base manifest (its bytes
-    are not in hand; committing would publish a generation that cannot be
-    reconstructed).
+    The stalled-writer defense. A writer that stalled past the GC grace may
+    find its not-yet-referenced packs (a) already swept, or (b) present but
+    TOMBSTONED — doomed to deletion next cycle, with GC's pre-delete re-HEAD
+    as the last gate. Immediately before the manifest lands (after which the
+    mark pass protects them):
+
+    - every NOVEL pack is unconditionally re-PUT from the bytes in hand —
+      this both heals (a) and refreshes the store mtime for (b), so the
+      pre-delete re-HEAD sees the pack went young and spares it (identical
+      bytes; content-addressed keys make the overwrite a no-op);
+    - every BASE pack (bytes not in hand) is HEAD-checked — if one vanished,
+      fail loudly: committing would publish a generation that cannot be
+      reconstructed. A present-but-tombstoned base pack needs no refresh:
+      it is referenced by the still-retained base manifest, so the mark
+      pass resurrects its tombstone.
     """
 
     def check(key: str) -> None:
+        sha = parse_pack_key(key)
+        body = novel.get(sha)
+        if body is not None:
+            # Unconditional PUT, not create-only: the mtime refresh is the
+            # point (put_pack's 412-is-success would leave a stale mtime).
+            store.put(key, body)
+            return
         try:
             store.head_meta(key)
         except ObjectNotFoundError:
-            sha = parse_pack_key(key)
-            body = novel.get(sha)
-            if body is None:
-                raise ExternalServiceError(
-                    f"base pack {sha} vanished before commit — the base "
-                    "generation was GC'd out from under this writer; rebase"
-                ) from None
-            put_pack(store, sha, body)
+            raise ExternalServiceError(
+                f"base pack {sha} vanished before this commit could land — "
+                "the base generation was GC'd out from under this writer; "
+                "re-read the head and retry the write"
+            ) from None
 
     keys = sorted(manifest.pack_keys())
+    if not keys:
+        return  # empty payload: no packs to verify
     with ThreadPoolExecutor(max_workers=min(max_workers, len(keys))) as pool:
         for future in [pool.submit(check, key) for key in keys]:
             future.result()
+
+
+# Reconstruct keeps at most this many fetched packs in memory at once
+# (~window x pack_target bytes ≈ 256 MiB at defaults). A payload of any size
+# reconstructs in bounded RAM; the cost is that a pack referenced again
+# OUTSIDE the window is re-fetched (rare: entries reference packs in nearly
+# file order, so locality is high).
+RECONSTRUCT_WINDOW_PACKS = 32
 
 
 def reconstruct(
@@ -330,54 +360,84 @@ def reconstruct(
 ) -> None:
     """Fetch referenced packs in parallel and write the byte-identical payload.
 
-    Each pack's bytes are verified against its content hash in the worker
-    (localizes corruption to one object); the assembled file is verified
-    against `file_sha256`. A pack 404 (GC swept an old generation mid-read)
-    propagates as ObjectNotFoundError so callers re-resolve the head, exactly
-    like today's whole-file fetch race.
+    Memory-bounded: packs are fetched in file-order windows of
+    `RECONSTRUCT_WINDOW_PACKS` (parallel within each window) and released as
+    the window completes, so a huge payload never materializes all its packs
+    at once. Each pack's bytes are verified against its content hash in the
+    worker (localizes corruption to one object); the assembled file is
+    verified against `file_sha256`. A pack 404 (GC swept an old generation
+    mid-read) propagates as ObjectNotFoundError so callers re-resolve the
+    head, exactly like today's whole-file fetch race.
     """
-    keys = sorted(manifest.pack_keys())
+    # Pack keys in FIRST-USE order — entries are in file order, so windows
+    # align with the write order and each pack is usually fetched once. A
+    # pack's first use is always reached at-or-before its window loads, so
+    # the only out-of-window case is a BACK-reference to an already-released
+    # pack (dedup reuse), fetched individually.
+    ordered: list[str] = []
+    position: dict[str, int] = {}
+    for entry in manifest.entries:
+        if entry.pack_sha256 not in position:
+            position[entry.pack_sha256] = len(ordered)
+            ordered.append(entry.pack_sha256)
 
-    def fetch(key: str) -> tuple[str, bytes]:
-        sha = parse_pack_key(key)
-        body = store.get(key).body
+    def fetch(sha: str) -> tuple[str, bytes]:
+        body = store.get(format_pack_key(sha)).body
         actual = hashlib.sha256(body).hexdigest()
         if actual != sha:
             raise ExternalServiceError(f"pack {sha} corrupt: content hashes to {actual}")
         return sha, body
 
+    def write_windows(out: BinaryIO, hasher: HashLike) -> None:
+        entry_index = 0
+        for start in range(0, len(ordered), RECONSTRUCT_WINDOW_PACKS):
+            window = ordered[start : start + RECONSTRUCT_WINDOW_PACKS]
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(window))) as pool:
+                bodies = dict(pool.map(fetch, window))
+            # Write every consecutive entry whose pack is in this window;
+            # an out-of-window back-reference is fetched individually.
+            while entry_index < len(manifest.entries):
+                entry = manifest.entries[entry_index]
+                body = bodies.get(entry.pack_sha256)
+                if body is None:
+                    if position[entry.pack_sha256] >= start + len(window):
+                        break  # pack belongs to a LATER window — advance
+                    _, body = fetch(entry.pack_sha256)  # rare back-reference
+                piece = body[entry.pack_offset : entry.pack_offset + entry.length]
+                if len(piece) != entry.length:
+                    raise ExternalServiceError(
+                        f"pack {entry.pack_sha256} too short for entry at "
+                        f"offset {entry.pack_offset}"
+                    )
+                out.write(piece)
+                hasher.update(piece)
+                entry_index += 1
+
+    def write_and_verify() -> None:
+        hasher = hashlib.sha256()
+        with dest.open("wb") as out:
+            write_windows(out, hasher)
+        if hasher.hexdigest() != manifest.file_sha256:
+            raise ExternalServiceError(
+                "reconstructed payload hash mismatch — manifest/packs corrupt"
+            )
+
     try:
-        if keys:
-            with ThreadPoolExecutor(max_workers=min(max_workers, len(keys))) as pool:
-                pack_bodies = dict(pool.map(fetch, keys))
-        else:
-            pack_bodies = {}
-        _assemble(manifest, pack_bodies, dest)
+        write_and_verify()
     except BaseException:
         dest.unlink(missing_ok=True)  # never leave a partial/corrupt file behind
         raise
 
 
-def _assemble(manifest: Manifest, pack_bodies: dict[str, bytes], dest: Path) -> None:
-    """Write entries' pack slices to `dest` in order; verify the file hash."""
-    hasher = hashlib.sha256()
-    with dest.open("wb") as out:
-        for entry in manifest.entries:
-            piece = pack_bodies[entry.pack_sha256][
-                entry.pack_offset : entry.pack_offset + entry.length
-            ]
-            if len(piece) != entry.length:
-                raise ExternalServiceError(
-                    f"pack {entry.pack_sha256} too short for entry at offset {entry.pack_offset}"
-                )
-            out.write(piece)
-            hasher.update(piece)
-    if hasher.hexdigest() != manifest.file_sha256:
-        raise ExternalServiceError("reconstructed payload hash mismatch — manifest/packs corrupt")
-
-
 def load_manifest(store: ObjectStore, payload_key: str) -> Manifest:
-    """Fetch and parse the manifest at a chunked generation's payload key."""
+    """Fetch and parse the manifest at a chunked generation's payload key.
+
+    Size-capped: the write path never produces a manifest over
+    MAX_MANIFEST_BYTES, so a larger object at a chunked payload key is
+    corruption — refuse before GETting an unbounded body.
+    """
+    if store.head_meta(payload_key).size > MAX_MANIFEST_BYTES:
+        raise InputValidationError(f"object at {payload_key} exceeds MAX_MANIFEST_BYTES")
     return Manifest.from_bytes(store.get(payload_key).body)
 
 

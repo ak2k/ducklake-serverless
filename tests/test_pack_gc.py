@@ -341,10 +341,15 @@ def test_dry_run_reports_but_deletes_nothing(store: InMemoryObjectStore, tmp_pat
     for seed in range(2, 5):
         bs.write(payload(seed))
     before = set(store.list_prefix(PACKS_PREFIX))
-    report = gc_mod.collect(store, "gc", retain_generations=1, dry_run=True)
+    report = gc_mod.collect(
+        store, "gc", retain_generations=1, dry_run=True, pack_grace=timedelta(0)
+    )
     assert report is not None
+    assert report.tombstoned_packs  # cycle 1 WOULD tombstone the orphaned packs
+    assert not report.swept_packs  # but never delete on a fresh ledger
     assert set(store.list_prefix(PACKS_PREFIX)) == before  # nothing deleted
-    assert not store.get(gc_mod._TOMBSTONE_KEY).body if False else True  # ledger untouched
+    # Ledger untouched: dry-run must not commit tombstones.
+    assert gc_mod._TOMBSTONE_KEY not in store.list_prefix("gc/")  # pyright: ignore[reportPrivateUsage]
 
 
 def test_raw_blob_with_magic_prefix_is_harmless(store: InMemoryObjectStore, tmp_path: Path) -> None:
@@ -377,11 +382,13 @@ def test_orphan_opaque_and_unknown_objects_are_ignored(
 
 
 class SweepNovelPacksBeforeManifest(InMemoryObjectStore):
-    """Deletes every pack at verify_packs' first HEAD (the pre-manifest gap).
+    """Deletes every pack at verify_packs' first refresh-PUT (pre-manifest gap).
 
     Models the stalled-writer race: GC swept the writer's novel packs during
-    the packs-landed→manifest-landed gap. verify_packs' HEAD then 404s and
-    it must heal (re-PUT from bytes in hand) so the commit reconstructs.
+    the packs-landed→manifest-landed gap. verify_packs re-PUTs every novel
+    pack unconditionally (`put`, which only verify_packs uses on packs/ —
+    publish_packs is create-only), so the sweep is healed inline and the
+    commit reconstructs.
     """
 
     def __init__(self) -> None:
@@ -389,12 +396,12 @@ class SweepNovelPacksBeforeManifest(InMemoryObjectStore):
         self.armed = True
 
     @override
-    def head_meta(self, key: str) -> ObjectMeta:
+    def put(self, key: str, body: bytes) -> str:
         if self.armed and key.startswith(PACKS_PREFIX):
             self.armed = False
             for pack_key in self.list_prefix(PACKS_PREFIX):
                 self.delete(pack_key)  # GC strikes in the gap
-        return super().head_meta(key)
+        return super().put(key, body)
 
 
 def test_stalled_writer_heal_via_verify_packs(tmp_path: Path) -> None:
@@ -410,3 +417,42 @@ def test_stalled_writer_heal_via_verify_packs(tmp_path: Path) -> None:
     bs.write(data)  # injection fires mid-commit; heal must recover
     assert not store.armed  # the injection actually fired
     assert bs.read() == data  # committed generation reconstructs
+
+
+def test_rewrite_of_tombstoned_content_refreshes_mtime(tmp_path: Path) -> None:
+    """CRITICAL regression (review finding): a writer whose NOVEL chunks
+    collide with old, possibly-tombstoned packs (content re-written after an
+    intermediate generation, so the base manifest lacks them) must refresh
+    those packs' mtimes — the twin-write 412 path must not leave a stale
+    mtime, or GC's pre-delete re-HEAD would delete a pack the just-committed
+    head references."""
+    store = InMemoryObjectStore()
+    work = tmp_path / "w"
+    work.mkdir()
+    bs = BlobStore(store, work, chunk_threshold=0)
+    bs.bootstrap(b"g0")
+    data = payload(3)
+    bs.write(data)  # gen 1: data's packs land
+    old_packs = set(store.list_prefix(PACKS_PREFIX))
+    before = {k: store.head_meta(k).last_modified for k in old_packs}
+
+    bs.write(payload(4))  # gen 2: unrelated — its manifest lacks data's chunks
+    bs.write(data)  # gen 3: data is NOVEL vs gen 2's base manifest → twin-write
+    after = {k: store.head_meta(k).last_modified for k in old_packs}
+    refreshed = [k for k in old_packs if after[k] != before[k]]
+    # The colliding packs got fresh mtimes despite already existing.
+    assert refreshed, "verify_packs did not refresh twin-written pack mtimes"
+    assert bs.read() == data
+
+
+def test_empty_payload_chunked_commit(tmp_path: Path) -> None:
+    """Regression (review finding): a zero-byte payload through the chunked
+    path (threshold 0) must commit, not crash verify_packs with
+    ThreadPoolExecutor(max_workers=0)."""
+    store = InMemoryObjectStore()
+    work = tmp_path / "w"
+    work.mkdir()
+    bs = BlobStore(store, work, chunk_threshold=0)
+    bs.bootstrap(b"seed")
+    bs.write(b"")  # empty: zero chunks, zero packs — must still commit
+    assert bs.read() == b""

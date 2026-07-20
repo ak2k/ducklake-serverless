@@ -343,7 +343,7 @@ def resolve_payloads(
                     resolved.append(CommittedWhole(doc=doc))
                 case "chunked":
                     try:
-                        manifest = Manifest.from_bytes(store.get(key).body)
+                        manifest = _load_committed_manifest(store, key)
                     except (ObjectNotFoundError, InputValidationError) as exc:
                         return RefuseSweep(
                             reason=f"committed chunked generation {generation} at {key} "
@@ -355,6 +355,18 @@ def resolve_payloads(
         if orphan is not None:
             resolved.append(orphan)
     return resolved
+
+
+def _load_committed_manifest(store: ObjectStore, key: str) -> Manifest:
+    """Fetch + parse a committed generation's manifest, size-capped.
+
+    The write path caps manifests at MAX_MANIFEST_BYTES; a larger object at a
+    committed chunked key is corruption — refuse (via InputValidationError)
+    rather than GET an unbounded body.
+    """
+    if store.head_meta(key).size > MAX_MANIFEST_BYTES:
+        raise InputValidationError(f"object at {key} exceeds MAX_MANIFEST_BYTES")
+    return Manifest.from_bytes(store.get(key).body)
 
 
 def _resolve_orphan(store: ObjectStore, key: str) -> OrphanManifest | OrphanOpaque | None:
@@ -374,12 +386,19 @@ def _resolve_orphan(store: ObjectStore, key: str) -> OrphanManifest | OrphanOpaq
 
 
 def _marker_for(store: ObjectStore, current: RootDoc, generation: int) -> RootDoc | None:
-    """The committed marker for `generation`, or None if none exists."""
+    """The committed marker for `generation`, or None if none exists.
+
+    Only a genuinely ABSENT marker returns None (→ orphan sniff). A marker
+    that exists but cannot be parsed raises (ExternalServiceError from
+    read_marker) and aborts the sweep: degrading an unreadable COMMITTED
+    generation to orphan-sniff could leave a chunked generation's packs
+    unmarked — the one misclassification that deletes live data.
+    """
     if generation == current.generation:
         return current
     try:
         return read_marker(store, generation)
-    except (ObjectNotFoundError, pydantic.ValidationError):
+    except ObjectNotFoundError:
         return None
 
 
@@ -532,7 +551,10 @@ def _pack_sweep(
             pack_metas.append(store.head_meta(key))
 
     tombstones = _load_tombstones(store)
-    plan = decide_pack_sweep(resolved, pack_metas, tombstones, _store_now(store), grace=grace)
+    # One store-clock probe per cycle (in dry-run it is the cycle's only
+    # write): every age comparison in the decision shares this instant.
+    store_now = _store_now(store)
+    plan = decide_pack_sweep(resolved, pack_metas, tombstones, store_now, grace=grace)
     match plan:
         case RefuseSweep(reason=reason):
             raise ExternalServiceError(reason)
@@ -543,25 +565,52 @@ def _pack_sweep(
     if dry_run:
         return _PackReport(swept=sorted(plan.delete), kept=kept, tombstoned=sorted(plan.tombstone))
 
+    # The resolve/decide phase above is unbounded (per-manifest GETs on a
+    # large lake); prove the lease is still ours before the commit point.
+    if not lease.renew():
+        raise ExternalServiceError(
+            "lost the maintenance lease before the tombstone commit — "
+            "another runner may be active; aborting with zero pack deletes"
+        )
     # Tombstone write is the commit point: it precedes any delete, and a
-    # failure aborts the cycle with zero deletes.
-    new_cold = {k: v for k, v in tombstones.cold_since.items() if k not in plan.resurrect}
+    # failure aborts the cycle with zero deletes. Dropping ledger rows for
+    # packs no longer listed keeps the ledger from growing without bound.
+    present = {m.key for m in pack_metas}
+    new_cold = {
+        k: v for k, v in tombstones.cold_since.items() if k not in plan.resurrect and k in present
+    }
     for key in plan.tombstone:
-        new_cold[key] = _store_now(store)
+        new_cold[key] = store_now
     for key in plan.delete:
         new_cold.pop(key, None)
     store.put(_TOMBSTONE_KEY, TombstoneDoc(cold_since=new_cold).to_json_bytes())
 
+    swept = _delete_cold_packs(store, lease, sorted(plan.delete), grace)
+    return _PackReport(
+        swept=swept,
+        kept=sorted({m.key for m in pack_metas} - set(swept)),
+        tombstoned=sorted(plan.tombstone),
+    )
+
+
+def _delete_cold_packs(
+    store: ObjectStore, lease: Lease, candidates: list[str], grace: timedelta
+) -> list[str]:
+    """Execute tombstone-aged deletes with the pre-delete re-HEAD gate."""
     swept: list[str] = []
-    for key in sorted(plan.delete):
+    # One fresh probe for the whole delete loop: the recheck compares pack
+    # mtimes refreshed by writers DURING resolve/decide against now.
+    recheck_now = _store_now(store)
+    for key in candidates:
         # Pre-delete re-HEAD: skip (and keep) any pack whose mtime went young
         # — a stalled writer's refresh-PUT raced us (the GC half of the
-        # stalled-writer defense).
+        # stalled-writer defense; the writer half is chunk.verify_packs'
+        # unconditional novel-pack re-PUT).
         try:
             meta = store.head_meta(key)
         except ObjectNotFoundError:
             continue  # already gone
-        if meta.last_modified is not None and (_store_now(store) - meta.last_modified) <= grace:
+        if meta.last_modified is not None and (recheck_now - meta.last_modified) <= grace:
             continue
         store.delete(key)
         swept.append(key)
@@ -570,11 +619,7 @@ def _pack_sweep(
                 "lost the maintenance lease mid-pack-sweep — stopping "
                 "(deletes so far are tombstoned-cold packs; safe)"
             )
-    return _PackReport(
-        swept=swept,
-        kept=sorted(set(m.key for m in pack_metas) - set(swept)),
-        tombstoned=sorted(plan.tombstone),
-    )
+    return swept
 
 
 # Floor for non-dry-run physical deletion. Below this, the age gate cannot
