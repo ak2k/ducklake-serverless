@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from ducklake_serverless import chunk as chunk_mod
 from ducklake_serverless.blob import BlobStore
 from ducklake_serverless.chunk import MANIFEST_MAGIC, PACKS_PREFIX
 from ducklake_serverless.errors import ExternalServiceError
@@ -162,8 +163,6 @@ def test_chunk_size_rescale_boundary_end_to_end(
     generation) and readers reconstruct across the size change. MAX_ENTRIES
     is monkeypatched tiny so a KB-scale payload crosses the same boundary a
     multi-GiB one would — same branches, no gigabytes."""
-    from ducklake_serverless import chunk as chunk_mod
-
     monkeypatch.setattr(chunk_mod, "MAX_ENTRIES", 8)
     monkeypatch.setattr(chunk_mod, "DEFAULT_CHUNK_SIZE", 1024)
     bs = make_blob(store, tmp_path, threshold=0)
