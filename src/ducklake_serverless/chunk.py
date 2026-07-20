@@ -300,6 +300,11 @@ def publish_packs(
             future.result()
 
 
+# Attempts for verify_packs' unconditional refresh-PUT, matching put_pack's
+# retry budget — the create-only heal it replaced retried transients too.
+_REFRESH_PUT_ATTEMPTS = 5
+
+
 def verify_packs(
     store: ObjectStore, manifest: Manifest, novel: dict[str, bytes], *, max_workers: int = 8
 ) -> None:
@@ -339,7 +344,18 @@ def verify_packs(
                 raise ExternalServiceError(f"novel pack map corrupt: bytes do not hash to {sha}")
             # Unconditional PUT, not create-only: the mtime refresh is the
             # point (put_pack's 412-is-success would leave a stale mtime).
-            store.put(key, body)
+            # Retried like put_pack (which this refresh replaced): no
+            # conditional header means no ambiguity to resolve, so a
+            # transient transport failure is simply retriable — one blip
+            # must not abort the whole commit.
+            for attempts_left in reversed(range(_REFRESH_PUT_ATTEMPTS)):
+                try:
+                    store.put(key, body)
+                except ExternalServiceError:
+                    if attempts_left == 0:
+                        raise
+                else:
+                    return
             return
         try:
             store.head_meta(key)

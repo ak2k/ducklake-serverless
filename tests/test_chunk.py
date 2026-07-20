@@ -353,3 +353,37 @@ def test_verify_packs_rejects_corrupt_novel_map(tmp_path: Path) -> None:
     with pytest.raises(ExternalServiceError, match="corrupt"):
         verify_packs(store, manifest, corrupt)
     assert store.get(format_pack_key(packs[0][0])).body == good  # untouched
+
+
+class FlakyPackPut(InMemoryObjectStore):
+    """Fails the first `fail_n` unconditional pack PUTs with a transient error."""
+
+    def __init__(self, fail_n: int) -> None:
+        super().__init__()
+        self.fail_n = fail_n
+
+    @override
+    def put(self, key: str, body: bytes) -> str:
+        if key.startswith(chunk.PACKS_PREFIX) and self.fail_n > 0:
+            self.fail_n -= 1
+            raise ExternalServiceError("transient blip")
+        return super().put(key, body)
+
+
+def test_verify_packs_refresh_put_retries_transients(tmp_path: Path) -> None:
+    """L2 regression: the refresh-PUT retries transient failures (the
+    create-only heal it replaced did) — one blip must not abort the commit;
+    a persistent failure still raises loudly."""
+    src = tmp_path / "f"
+    src.write_bytes(b"x" * 4096)
+    manifest, packs = build_manifest(src, None, chunk_size=1024, pack_target=8192)
+
+    store = FlakyPackPut(fail_n=1)
+    publish_packs(store, packs)
+    verify_packs(store, manifest, chunk.novel_pack_index(packs))  # survives the blip
+    assert store.get(format_pack_key(packs[0][0])).body == packs[0][1]
+
+    persistent = FlakyPackPut(fail_n=10**6)
+    publish_packs(persistent, packs)
+    with pytest.raises(ExternalServiceError, match="transient blip"):
+        verify_packs(persistent, manifest, chunk.novel_pack_index(packs))

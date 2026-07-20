@@ -114,5 +114,7 @@ uv sync
 make check   # ruff + basedpyright strict + pytest (moto CAS conformance included)
 ```
 
-See `AGENTS.md` for the contribution contract and protocol invariants, and
+See [`docs/DESIGN.md`](docs/DESIGN.md) for the consolidated invariants,
+failure asymmetry, and accepted residual risks, `AGENTS.md` for the
+contribution contract, and
 [`docs/ROADMAP.md`](docs/ROADMAP.md) for what's planned and deliberately deferred.

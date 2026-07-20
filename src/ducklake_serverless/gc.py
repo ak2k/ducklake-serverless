@@ -636,6 +636,11 @@ def _pack_sweep(
         k: v for k, v in tombstones.cold_since.items() if k not in plan.resurrect and k in present
     }
     for key in plan.tombstone:
+        # Stamped with the pre-decide probe, so next cycle reads this
+        # tombstone as older by the decide+renew duration — the one hoisted
+        # direction that is NOT conservative. Seconds of erosion against
+        # MIN_PACK_GRACE's 1h floor (which already absorbs store-clock
+        # second-granularity; see the floor's comment).
         new_cold[key] = store_now
     for key in plan.delete:
         new_cold.pop(key, None)

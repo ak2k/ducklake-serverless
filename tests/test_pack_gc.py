@@ -517,3 +517,85 @@ def test_stale_gc_cycle_fenced_by_ledger_etag(tmp_path: Path) -> None:
             _unsafe_allow_short_grace=True,
         )
     assert set(store.list_prefix(PACKS_PREFIX)) == packs_before  # ZERO deletes
+
+
+class RivalCreatesLedgerFirst(InMemoryObjectStore):
+    """Both runners see the ledger ABSENT; the rival's create-only PUT lands
+    first (injected at our cycle's clock probe — after ledger load, before
+    the commit point). Our put_if_absent must 412 and abort the cycle."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.rival_body = TombstoneDoc(cold_since={}).to_json_bytes()
+
+    @override
+    def put(self, key: str, body: bytes) -> str:
+        if self.armed and key == gc_mod._CLOCK_PROBE_KEY:  # pyright: ignore[reportPrivateUsage]
+            self.armed = False
+            super().put_if_absent(
+                gc_mod._TOMBSTONE_KEY,  # pyright: ignore[reportPrivateUsage]
+                self.rival_body,
+            )
+        return super().put(key, body)
+
+
+def test_both_absent_race_loser_aborts_without_clobber(tmp_path: Path) -> None:
+    """L6 regression (fence, LedgerAbsent branch): when two runners both load
+    an absent ledger, the loser's create-only commit 412s → abort; the
+    winner's ledger survives untouched."""
+    store = RivalCreatesLedgerFirst()
+    work = tmp_path / "w"
+    work.mkdir()
+    bs = BlobStore(store, work, chunk_threshold=0)  # pyright: ignore[reportArgumentType]
+    bs.bootstrap(b"g0")
+    bs.write(payload(1))
+    bs.write(payload(2))  # gen1's packs become unreferenced → tombstone-able
+    packs_before = set(store.list_prefix(PACKS_PREFIX))
+
+    store.armed = True  # rival wins the create between our load and commit
+    with pytest.raises(ExternalServiceError, match="rival GC runner"):
+        gc_mod.collect(
+            store,
+            "gc",
+            retain_generations=1,
+            dry_run=False,
+            pack_grace=timedelta(0),
+            _unsafe_allow_short_grace=True,
+        )
+    # Winner's ledger intact — the loser neither clobbered nor deleted.
+    ledger_key = gc_mod._TOMBSTONE_KEY  # pyright: ignore[reportPrivateUsage]
+    assert store.get(ledger_key).body == store.rival_body
+    assert set(store.list_prefix(PACKS_PREFIX)) == packs_before
+
+
+def test_corrupt_ledger_replaced_and_coldness_reset(tmp_path: Path) -> None:
+    """L6 regression (fence, LedgerCorrupt branch): a garbage ledger is
+    replaced outright by a valid one; coldness resets, so the cycle
+    tombstones but never deletes (delay-only harm)."""
+    store = InMemoryObjectStore()
+    work = tmp_path / "w"
+    work.mkdir()
+    bs = BlobStore(store, work, chunk_threshold=0)
+    bs.bootstrap(b"g0")
+    bs.write(payload(1))
+    bs.write(payload(2))  # gen1's packs become unreferenced → tombstone-able
+    ledger_key = gc_mod._TOMBSTONE_KEY  # pyright: ignore[reportPrivateUsage]
+    store.put(ledger_key, b"{ not json")  # corrupt ledger on disk
+    packs_before = set(store.list_prefix(PACKS_PREFIX))
+
+    report = gc_mod.collect(
+        store,
+        "gc",
+        retain_generations=1,
+        dry_run=False,
+        pack_grace=timedelta(0),
+        _unsafe_allow_short_grace=True,
+    )
+    assert report is not None
+    assert report.tombstoned_packs  # cold again from scratch
+    assert not report.swept_packs  # coldness reset: no deletes this cycle
+    assert set(store.list_prefix(PACKS_PREFIX)) == packs_before
+    # The garbage was replaced by a valid ledger carrying the tombstones.
+    doc = TombstoneDoc.from_json_bytes(store.get(ledger_key).body)
+    assert set(doc.cold_since) == set(report.tombstoned_packs)
