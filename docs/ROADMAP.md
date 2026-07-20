@@ -32,6 +32,27 @@ Residue worth keeping here:
   flaky-transport writers (see DESIGN.md residuals), pack compression via
   the manifest's `compression` field.
 
+## Pre-deployment checklist (before first production lake)
+
+Local drills done 2026-07-20 (see `scripts/soak_crash_drill.py`, rerunnable):
+soak with genuinely-elapsing grace vs wet GC (full tombstone->delete
+lifecycles, byte-identical head throughout) and SIGKILL crash-recovery
+(writers + GC killed mid-flight; convergence after every kill), both against
+real SeaweedFS. The chunk-size rescale boundary runs end-to-end in the
+hermetic suite (MAX_ENTRIES monkeypatched tiny).
+
+Remaining, deliberately deferred:
+
+- [ ] One integration run against REAL AWS S3 (the canonical store; MinIO/
+      SeaweedFS are proxies): `DUCKLAKE_IT_*` at a scratch bucket, run the
+      integration lane + `scripts/soak_crash_drill.py`. Probe R2/GCS too if
+      they will host lakes.
+- [ ] Overnight default-floor soak: `soak_crash_drill.py --grace-seconds
+      3600 --rounds 100` (no unsafe flag — the true default path).
+- [ ] GB-scale throughput/memory envelope (windowed reconstruct at real
+      payload sizes) — perf, not correctness; when a real large-payload
+      workload exists.
+
 ## Deferred — physical `core/` + `adapters/` reorg
 
 Move engine modules into `src/ducklake_serverless/core/` and the DuckLake

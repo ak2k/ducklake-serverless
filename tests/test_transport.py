@@ -152,3 +152,45 @@ def test_lake_stream_true_on_chunked_head_raises(
         pass
     with lake.reader(stream="auto") as con:
         assert con.execute("SELECT count(*) FROM t") == [(0,)]
+
+
+def test_chunk_size_rescale_boundary_end_to_end(
+    store: InMemoryObjectStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rescale cliff, end to end: a payload outgrowing chunk_size *
+    MAX_ENTRIES doubles the chunk size (dedup deliberately drops for that
+    generation) and readers reconstruct across the size change. MAX_ENTRIES
+    is monkeypatched tiny so a KB-scale payload crosses the same boundary a
+    multi-GiB one would — same branches, no gigabytes."""
+    from ducklake_serverless import chunk as chunk_mod
+
+    monkeypatch.setattr(chunk_mod, "MAX_ENTRIES", 8)
+    monkeypatch.setattr(chunk_mod, "DEFAULT_CHUNK_SIZE", 1024)
+    bs = make_blob(store, tmp_path, threshold=0)
+    bs.bootstrap()
+
+    small = bytes(i % 251 for i in range(6 * 1024))  # 6 chunks @1K — under cap
+    bs.write(small)
+    doc1 = head(store)
+    m1 = chunk_mod.load_manifest(store, doc1.payload_key)
+    assert m1.chunk_size == 1024
+
+    # Outgrow the cap at the base's size: 20K > 1K * 8 -> doubles to 4K
+    # (1K*8=8K < 20K, 2K*8=16K < 20K, 4K*8=32K >= 20K).
+    big = small + bytes((i * 7) % 251 for i in range(14 * 1024))
+    bs.write(big)
+    doc2 = head(store)
+    m2 = chunk_mod.load_manifest(store, doc2.payload_key)
+    assert m2.chunk_size == 4096  # rescaled across the boundary
+    assert len(m2.entries) <= 8
+    assert bs.read() == big  # reconstructs across the size change
+
+    # Next generation dedups again at the NEW size (base pins 4096).
+    edited = bytearray(big)
+    edited[0] = (edited[0] + 1) % 256
+    bs.write(bytes(edited))
+    m3 = chunk_mod.load_manifest(store, head(store).payload_key)
+    assert m3.chunk_size == 4096
+    shared = {e.pack_sha256 for e in m2.entries} & {e.pack_sha256 for e in m3.entries}
+    assert shared  # dedup resumed after the rescale generation
+    assert bs.read() == bytes(edited)
