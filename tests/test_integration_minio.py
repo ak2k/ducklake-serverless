@@ -18,6 +18,7 @@ from __future__ import annotations
 import concurrent.futures
 import contextlib
 import os
+import time
 import uuid
 from datetime import timedelta
 from typing import TYPE_CHECKING, Literal
@@ -273,3 +274,98 @@ def test_data_maintenance_over_real_store(prefix: str, tmp_path: Path) -> None:
         # sum() forces real Parquet reads over httpfs — count(*) answers
         # from catalog metadata and passes even when files are gone.
         assert con.execute("SELECT count(*), sum(id) FROM t") == [(50000, 1249975000)]
+
+
+@requires_minio
+def test_chunked_lifecycle_real_s3(prefix: str, tmp_path: Path) -> None:
+    """Full chunked lifecycle against a REAL S3 API — the semantics the
+    hermetic fake cannot falsify: real ETags on the fenced ledger
+    put_if_match, real LastModified granularity for grace gating, real
+    listing behavior for the mark pass, and verify_packs' unconditional
+    refresh-PUT on a store that enforces conditional writes.
+
+    Bootstrap -> chunked commits (threshold 0) -> dedup across generations ->
+    a real GC cycle (tombstone, then aged delete) -> reader reconstructs
+    byte-identically -> referenced packs survive.
+    """
+    from ducklake_serverless.blob import BlobStore  # noqa: PLC0415
+    from ducklake_serverless.chunk import PACKS_PREFIX, Manifest  # noqa: PLC0415
+    from ducklake_serverless.errors import InputValidationError  # noqa: PLC0415
+    from ducklake_serverless.gc import (  # noqa: PLC0415
+        _TOMBSTONE_KEY,  # pyright: ignore[reportPrivateUsage]
+        TombstoneDoc,
+    )
+
+    store = S3ObjectStore(_client(), BUCKET, prefix=prefix)
+    bs = BlobStore(store, tmp_path / "bw", chunk_threshold=0)
+    (tmp_path / "bw").mkdir(exist_ok=True)
+
+    bs.bootstrap(b"gen0")
+    data = bytes((i * 31 + 7) % 251 for i in range(300_000))
+    bs.write(data)
+    head1 = bs.head()
+    assert head1.transport == "chunked"
+    packs_v1 = set(store.list_prefix(PACKS_PREFIX))
+    assert packs_v1
+
+    # Dedup on real S3: a small edit ships far fewer novel pack bytes.
+    edited = bytearray(data)
+    edited[999:1009] = b"EDITEDEDIT"
+    bs.write(bytes(edited))
+    packs_v2 = set(store.list_prefix(PACKS_PREFIX))
+    novel = packs_v2 - packs_v1
+    novel_bytes = sum(store.head_meta(k).size for k in novel)
+    assert novel_bytes < len(data) // 4
+    assert bs.read() == bytes(edited)  # windowed reconstruct, real GETs
+
+    # Age gen1's unique packs out of the window, then run REAL GC cycles.
+    for seed in range(3, 7):
+        bs.write(bytes((i * 13 + seed) % 251 for i in range(50_000)))
+
+    # Real stores stamp LastModified at second granularity: a pack written
+    # <1s ago has age 0, and age <= grace(0) reads as YOUNG (the safe
+    # direction — this is by design; the hermetic fake's microsecond clock
+    # can't exhibit it). Sleep past the granularity so ages go positive.
+    time.sleep(2)
+
+    r1 = collect(
+        store,
+        "it-gc",
+        retain_generations=1,
+        dry_run=False,
+        pack_grace=timedelta(0),
+        _unsafe_allow_short_grace=True,
+    )
+    assert r1 is not None
+    assert r1.tombstoned_packs and not r1.swept_packs  # cycle K: record only
+
+    # Age the tombstones (rewrite the ledger with old stamps) — exercises the
+    # fenced put_if_match against REAL ETag semantics on the next cycle.
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    old = datetime(2000, 1, 1, tzinfo=UTC)
+    aged = TombstoneDoc(cold_since=dict.fromkeys(r1.tombstoned_packs, old))
+    store.put(_TOMBSTONE_KEY, aged.to_json_bytes())
+
+    r2 = collect(
+        store,
+        "it-gc",
+        retain_generations=1,
+        dry_run=False,
+        pack_grace=timedelta(0),
+        _unsafe_allow_short_grace=True,
+    )
+    assert r2 is not None
+    assert set(r2.swept_packs) == set(r1.tombstoned_packs)  # cycle K+1 deletes
+
+    # Safety invariant on real S3: every pack referenced by any retained
+    # manifest still exists; the head reconstructs byte-identically.
+    surviving = set(store.list_prefix(PACKS_PREFIX))
+    referenced: set[str] = set()
+    for key in store.list_prefix("payload/"):
+        try:
+            referenced |= Manifest.from_bytes(store.get(key).body).pack_keys()
+        except InputValidationError:
+            continue  # whole-file payloads aren't manifests
+    assert referenced <= surviving
+    assert bs.read() == bytes((i * 13 + 6) % 251 for i in range(50_000))
