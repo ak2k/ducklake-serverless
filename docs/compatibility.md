@@ -11,11 +11,11 @@ do not edit by hand.
 
 | Backend | Version | Conditional writes | Last verified | Provenance |
 |---|---|---|---|---|
-| MinIO | `RELEASE.2025-09-07T16-13-09Z` | ✅ atomic — safe for concurrent writers | 2026-07-13 | ci |
-| SeaweedFS | `4.38` | ✅ atomic — safe for concurrent writers | 2026-07-13 | ci |
-| moto | `5.2.2` | ✅ atomic — safe for concurrent writers | 2026-07-13 | ci |
-| garage | `v2.3.0` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-13 | ci |
-| rclone serve s3 | `1.74.3` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-13 | ci |
+| MinIO | `RELEASE.2025-09-07T16-13-09Z` | ✅ atomic — safe for concurrent writers | 2026-07-20 | ci |
+| SeaweedFS | `4.38` | ✅ atomic — safe for concurrent writers | 2026-07-20 | ci |
+| moto | `5.2.2` | ✅ atomic — safe for concurrent writers | 2026-07-20 | ci |
+| garage | `v2.3.0` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-20 | ci |
+| rclone serve s3 | `1.74.3` | ❌ accepts but IGNORES — unsafe, corrupts silently | 2026-07-20 | ci |
 | AWS S3 | `(service)` | ✅ atomic — safe for concurrent writers | 2024-11-25 | AWS launch announcement + delta-rs production use |
 | iDrive E2 | `(service)` | ⚠️ sequential only — UNSAFE under concurrency (silently loses commits) | 2026-07-07 | manual probe: enforces sequentially but NOT under concurrency (14-15/15 multi-winner) — unsafe for concurrent writers |
 
