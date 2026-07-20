@@ -20,6 +20,7 @@ from ducklake_serverless.errors import (
     AmbiguousCasError,
     ConditionalConflictError,
     ExternalServiceError,
+    InputValidationError,
     ObjectNotFoundError,
     PreconditionFailedError,
 )
@@ -164,6 +165,10 @@ class S3ObjectStore:
 
     def get_range(self, key: str, start: int, length: int) -> bytes:
         """Ranged GET — the selective-read primitive (fsspec adapter)."""
+        if start < 0:
+            # A negative start would emit a malformed Range header, which
+            # real S3 IGNORES (returns the full object) — fail loudly instead.
+            raise InputValidationError(f"negative range start {start}")
         if length <= 0:
             return b""
         try:
@@ -495,7 +500,14 @@ class InMemoryObjectStore:
             return GetResult(body=body, etag=etag, last_modified=written)
 
     def get_range(self, key: str, start: int, length: int) -> bytes:
-        """Ranged read with S3 semantics (empty past EOF, truncated at EOF)."""
+        """Ranged read with S3 semantics (empty past EOF, truncated at EOF).
+
+        Negative start raises: Python slice semantics would read from the
+        END while real S3 treats the header as malformed — the fake must
+        never green-light behavior the real store would not.
+        """
+        if start < 0:
+            raise InputValidationError(f"negative range start {start}")
         with self._lock:
             try:
                 body, _, _ = self._objects[key]

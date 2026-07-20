@@ -20,6 +20,7 @@ from moto import mock_aws
 from ducklake_serverless.errors import (
     AmbiguousCasError,
     ExternalServiceError,
+    InputValidationError,
     ObjectNotFoundError,
     PreconditionFailedError,
 )
@@ -192,3 +193,42 @@ def test_probe_fails_loud_on_ambiguous_racer() -> None:
 
     with pytest.raises(ExternalServiceError, match="indeterminate"):
         probe_atomic_create(AmbiguousCreate(), racers=4)
+
+
+def test_get_range_conformance(store: S3ObjectStore) -> None:
+    """get_range's documented contract against real-S3 semantics (moto).
+
+    Interior exact; EOF truncation; start at/past EOF -> b''; length<=0 ->
+    b''; negative start raises; missing key -> ObjectNotFoundError.
+    """
+    body = bytes(range(256))
+    store.put_if_absent("payload/r", body)
+
+    assert store.get_range("payload/r", 10, 5) == body[10:15]  # interior
+    assert store.get_range("payload/r", 250, 100) == body[250:]  # EOF truncation
+    assert store.get_range("payload/r", 256, 1) == b""  # start == size
+    assert store.get_range("payload/r", 999, 10) == b""  # start past EOF
+    assert store.get_range("payload/r", 0, 0) == b""
+    assert store.get_range("payload/r", 0, -5) == b""
+    with pytest.raises(InputValidationError):
+        store.get_range("payload/r", -5, 10)
+    with pytest.raises(ObjectNotFoundError):
+        store.get_range("payload/missing", 0, 10)
+
+
+def test_get_range_conformance_inmemory() -> None:
+    """The in-memory fake matches the same contract exactly."""
+    store = InMemoryObjectStore()
+    body = bytes(range(256))
+    store.put_if_absent("payload/r", body)
+
+    assert store.get_range("payload/r", 10, 5) == body[10:15]
+    assert store.get_range("payload/r", 250, 100) == body[250:]
+    assert store.get_range("payload/r", 256, 1) == b""
+    assert store.get_range("payload/r", 999, 10) == b""
+    assert store.get_range("payload/r", 0, 0) == b""
+    assert store.get_range("payload/r", 0, -5) == b""
+    with pytest.raises(InputValidationError):
+        store.get_range("payload/r", -5, 10)
+    with pytest.raises(ObjectNotFoundError):
+        store.get_range("payload/missing", 0, 10)

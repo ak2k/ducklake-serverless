@@ -8,25 +8,41 @@ manifest is exactly a range index: fixed-offset chunks mean any file range
 maps to a contiguous run of entries, each naming `(pack, pack_offset,
 length)`. This filesystem translates range reads into ranged GETs of only
 the covering pack slices — streaming-equivalent selective reads over a
-CHUNKED generation, plus something httpfs never had: per-chunk hash
-verification of every fully-covered chunk it serves.
+CHUNKED generation, plus something httpfs never had: hash verification of
+every chunk a fetched slice fully covers.
 
 Paths name generations explicitly (immutable snapshots, in keeping with the
 frozen-generation reading model):
 
     head            — the current head generation (resolved once per open)
-    gen/<number>    — a specific generation
+    gen/<number>    — a specific generation (canonical decimal digits only)
+
+`head` re-resolves per call: a single open is a consistent snapshot, but an
+info-then-open pair (or multiple opens) can straddle a commit. Multi-open
+consumers (pyarrow datasets, dask) should pin first: `path = fs.pin("head")`
+returns the concrete `gen/<n>` path for the current head.
 
 Whole-file generations are served by ranged GETs against their single
 payload object; chunked generations by manifest translation. Everything is
-read-only: any write/mutation entry point raises.
+read-only: mutation entry points raise. Missing paths surface as
+`FileNotFoundError` (the fsspec ecosystem contract); transport failures
+surface as this library's domain errors — an outage is never reported as
+absence.
 
-Requires the `fsspec` extra.
+Requires the `fsspec` extra. Scope, honestly stated:
 
-Consumers: anything fsspec-aware reads generations selectively —
-`fs.open("head")` for pandas/polars/pyarrow, `fsspec.open` chains, or plain
-file-like code. DuckDB's scan functions (`read_parquet`/`read_csv`) also go
-through registered fsspec filesystems.
+- Use by INSTANCE: `fs = GenerationFileSystem(store)` then `fs.open(...)`,
+  `pandas.read_parquet(..., filesystem=fs)`, or DuckDB
+  `con.register_filesystem(fs)` for its scan functions
+  (`read_parquet`/`read_csv`/`read_blob`). URL-only construction
+  (`fsspec.open("ducklake-serverless://...")`) is NOT supported — the
+  constructor needs a live ObjectStore, and the class is deliberately not
+  registered with fsspec's registry.
+- Process-local: the filesystem (and its store/boto3 client) does not
+  pickle; construct per process for dask/multiprocessing.
+- fsspec's default readahead cache prefetches ~5 MB per miss. For exact
+  point reads pass `cache_type="none"` (or a small `block_size`) to
+  `fs.open`.
 
 Known limitation — DuckDB ATTACH: DuckDB's `ATTACH` opens database files
 through its C++ filesystem layer only (native paths + httpfs); registered
@@ -34,32 +50,31 @@ fsspec filesystems are consulted for scans, never for ATTACH (verified
 against duckdb 1.5; upstream docs concur). Attaching a chunked DuckLake
 generation therefore still goes through local reconstruction
 (`Lake.reader()` / `GenerationCache.fetch_copy`) — which is windowed,
-parallel, and cached. This filesystem gives every OTHER reader selective
-access, and pins the head/gen-N snapshot semantics DuckDB readers get from
-the reconstruction path.
+parallel, and cached.
 """
 
 from __future__ import annotations
 
-# fsspec ships no py.typed, so its base classes are Unknown to basedpyright.
-# Per the repo contract (same treatment as duckdb in engine.py), this module
-# IS the fsspec facade: the suppressions for the untyped dependency live here
-# and nowhere else. Our own code below the facade line stays strictly typed.
-# pyright: reportMissingImports=false, reportUnknownVariableType=false
-# pyright: reportUnknownMemberType=false, reportUntypedBaseClass=false
-# pyright: reportGeneralTypeIssues=false, reportUnknownArgumentType=false
+# fsspec ships no py.typed. Per AGENTS.md's untyped-dependency pattern this
+# module is its one facade: downgrade exactly the Unknown-type trio to
+# warnings here; everything else stays strict, with per-line ignores at the
+# few fsspec call sites.
+# pyright: reportUnknownMemberType=warning, reportUnknownArgumentType=warning
+# pyright: reportUnknownVariableType=warning
 import bisect
+import contextlib
 import hashlib
+import re
 from typing import TYPE_CHECKING, Any, override
 
-from fsspec import AbstractFileSystem
-from fsspec.spec import AbstractBufferedFile
+from fsspec import AbstractFileSystem  # pyright: ignore[reportMissingImports]  # no py.typed
+from fsspec.spec import AbstractBufferedFile  # pyright: ignore[reportMissingImports]  # no py.typed
 
 from ducklake_serverless import chunk
 from ducklake_serverless.errors import (
     ExternalServiceError,
     InputValidationError,
-    ObjectNotFoundError,
+    NotFoundError,
 )
 from ducklake_serverless.root import read_marker, resolve_head
 
@@ -68,10 +83,11 @@ if TYPE_CHECKING:
     from ducklake_serverless.models import RootDoc
     from ducklake_serverless.objectstore import ObjectStore
 
-# Verify chunk hashes on selective reads. Only chunks FULLY covered by a
-# fetched slice can be verified (a partial chunk read can't be hashed);
-# sequential scans therefore verify nearly everything they touch.
-VERIFY_CHUNKS = True
+# Canonical generation path: decimal digits only. int()'s leniency
+# (underscores, '+', whitespace, unicode digits) would otherwise make
+# 'gen/5_0' a silent alias of generation 50 — wrong-snapshot reads with
+# valid checksums, the worst failure shape for an immutable-history store.
+_GEN_RE = re.compile(r"^gen/(0|[1-9][0-9]*)$")
 
 
 class _RangeReader:
@@ -94,6 +110,8 @@ class _WholeReader(_RangeReader):
 
     @override
     def read_range(self, start: int, length: int) -> bytes:
+        if start < 0:
+            raise InputValidationError("negative read offset")
         return self._store.get_range(self._key, start, length)
 
 
@@ -106,7 +124,8 @@ class _ChunkedReader(_RangeReader):
     entry's bytes come from ONE ranged GET of its pack slice. Adjacent
     entries living contiguously in the same pack coalesce into a single GET
     (the common case by construction — build_manifest packs novel chunks in
-    file order).
+    file order). Every chunk a fetched slice fully covers is hash-verified;
+    partially-covered edge chunks cannot be (no full bytes to hash).
     """
 
     def __init__(self, store: ObjectStore, manifest: Manifest) -> None:
@@ -126,6 +145,11 @@ class _ChunkedReader(_RangeReader):
 
     @override
     def read_range(self, start: int, length: int) -> bytes:
+        if start < 0:
+            # bisect with a negative start would wrap to the LAST entry and
+            # return wrong bytes; unreachable via fsspec (seek rejects
+            # negatives) but this seam must not rely on its callers.
+            raise InputValidationError("negative read offset")
         end = min(start + max(0, length), self.size)
         if start >= end:
             return b""
@@ -151,7 +175,8 @@ class _ChunkedReader(_RangeReader):
                 pack_off_end += entries[run_end_idx].length
             run_file_start = entry_start
             run_file_end = self._starts[run_end_idx] + entries[run_end_idx].length
-            # Clip the run to the requested range, then translate to pack space.
+            # Clip the run to the requested range, then translate to pack
+            # space (within a run, file-delta == pack-delta by construction).
             want_start = max(pos, run_file_start)
             want_end = min(end, run_file_end)
             pack_start = entry.pack_offset + (want_start - run_file_start)
@@ -163,8 +188,7 @@ class _ChunkedReader(_RangeReader):
                     f"pack {entry.pack_sha256} returned a short range — "
                     "pack truncated or swept mid-read"
                 )
-            if VERIFY_CHUNKS:
-                self._verify_covered_chunks(idx, run_end_idx, want_start, want_end, got)
+            self._verify_covered_chunks(idx, run_end_idx, want_start, want_end, got)
             out += got
             pos = want_end
             idx = run_end_idx + 1
@@ -195,50 +219,96 @@ def _reader_for(store: ObjectStore, doc: RootDoc) -> _RangeReader:
             return _ChunkedReader(store, chunk.load_manifest(store, doc.payload_key))
 
 
-class GenerationFile(AbstractBufferedFile):
+class GenerationFile(AbstractBufferedFile):  # pyright: ignore[reportUntypedBaseClass]
     """Read-only buffered file over one generation (fsspec plumbing)."""
 
     def __init__(
         self, fs: GenerationFileSystem, path: str, reader: _RangeReader, **kwargs: Any
     ) -> None:
         self._reader = reader
-        super().__init__(fs, path, mode="rb", size=reader.size, **kwargs)
+        super().__init__(fs, path, mode="rb", size=reader.size, **kwargs)  # pyright: ignore[reportUnknownMemberType]
 
-    @override
     def _fetch_range(self, start: int, end: int) -> bytes:
         return self._reader.read_range(start, end - start)
 
 
-class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUnsafeMultipleInheritance]
+class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntypedBaseClass, reportUnsafeMultipleInheritance]  # fsspec's _Cached metaclass mixes untyped state pyright can't see
     """Read-only fsspec filesystem exposing generations as files.
 
-    `ducklake-serverless://head` is the current head (resolved at open —
-    each open is a consistent immutable snapshot); `ducklake-serverless://
-    gen/<n>` pins a specific generation. Selective reads: chunked
-    generations fetch only the pack slices covering each requested range.
+    `head` is the current head (resolved per call — see the module docstring
+    for pinning); `gen/<n>` pins a specific generation. Selective reads:
+    chunked generations fetch only the pack slices covering each requested
+    range. Missing paths raise FileNotFoundError; transport failures raise
+    domain errors (never reported as absence).
     """
 
     protocol = "ducklake-serverless"
     root_marker = ""
+    # fsspec's instance cache tokenizes ctor args via str(); a live store's
+    # default repr is its memory address — repr-fragile (any store class
+    # adding a value-style __repr__ would silently alias DIFFERENT lakes to
+    # one cached filesystem: wrong-lake reads with no error) and the cache
+    # strong-refs every store forever. A live handle is not a cache key.
+    cachable = False
 
     def __init__(self, store: ObjectStore, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+        super().__init__(**kwargs)  # pyright: ignore[reportUnknownMemberType]
         self._store = store
+        # Readers memoized per payload key: generations are immutable, so
+        # this is trivially correct, and it stops the info-then-open pattern
+        # (pandas/pyarrow) from downloading a chunked generation's manifest
+        # twice — or ls() from downloading one per generation per call.
+        self._readers: dict[str, _RangeReader] = {}
+
+    @classmethod
+    def _strip_protocol(cls, path: str) -> str:
+        # Base strips 'proto://' and trailing '/'; also strip leading '/'
+        # (the memory-filesystem pattern) so inherited helpers (_parent,
+        # glob machinery) agree with our protocol-free, slash-free names.
+        stripped: str = super()._strip_protocol(path)  # pyright: ignore[reportUnknownMemberType]
+        return stripped.lstrip("/")
+
+    def pin(self, path: str = "head") -> str:
+        """Resolve `path` to its concrete, immutable `gen/<n>` form.
+
+        Multi-open consumers should pin once and use the returned path for
+        every subsequent open, so all reads come from one snapshot.
+        """
+        return f"gen/{self._resolve(path).generation}"
 
     def _resolve(self, path: str) -> RootDoc:
-        name = self._strip_protocol(path).strip("/")
-        if name == "head":
-            doc, _ = resolve_head(self._store)
-            return doc
-        if name.startswith("gen/"):
-            try:
-                generation = int(name.removeprefix("gen/"))
-            except ValueError:
-                raise InputValidationError(f"not a generation path: {path!r}") from None
-            return read_marker(self._store, generation)
-        raise InputValidationError(f"unknown path {path!r} — use 'head' or 'gen/<number>'")
+        """Marker for the generation `path` names.
 
-    @override
+        Raises FileNotFoundError for anything that does not resolve to an
+        extant generation (fsspec ecosystem contract — consumers probe with
+        `except FileNotFoundError`); transport failures propagate as domain
+        errors so an outage is never mistaken for absence.
+        """
+        name = self._strip_protocol(path)
+        if name == "head":
+            try:
+                doc, _ = resolve_head(self._store)
+            except NotFoundError as exc:  # uninitialized lake: no roots/0 yet
+                raise FileNotFoundError(path) from exc
+            return doc
+        m = _GEN_RE.match(name)
+        if m is None:
+            raise FileNotFoundError(path)
+        try:
+            return read_marker(self._store, int(m.group(1)))
+        except NotFoundError as exc:  # no such generation
+            raise FileNotFoundError(path) from exc
+
+    def _reader(self, doc: RootDoc) -> _RangeReader:
+        reader = self._readers.get(doc.payload_key)
+        if reader is None:
+            try:
+                reader = _reader_for(self._store, doc)
+            except NotFoundError as exc:  # payload swept (generation aged out)
+                raise FileNotFoundError(doc.payload_key) from exc
+            self._readers[doc.payload_key] = reader
+        return reader
+
     def _open(
         self,
         path: str,
@@ -254,7 +324,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUnsafeM
         return GenerationFile(
             self,
             path,
-            _reader_for(self._store, doc),
+            self._reader(doc),
             block_size=block_size,
             cache_options=cache_options,
             # Forward caching kwargs (cache_type etc.) — dropping them here
@@ -263,48 +333,103 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUnsafeM
             **kwargs,
         )
 
-    @override
+    def _dir_entry(self, name: str) -> dict[str, Any]:
+        return {"name": name, "size": 0, "type": "directory"}
+
     def info(self, path: str, **kwargs: Any) -> dict[str, Any]:
-        """Size/type for one generation path (fsspec metadata contract)."""
+        """Size/type for one path (fsspec metadata contract).
+
+        `""` (root) and `gen` are directories; `head` and `gen/<n>` are
+        files. `etag` is a stable immutable identity (the payload key), so
+        fsspec cache layers (filecache/blockcache) key correctly forever.
+        """
+        name = self._strip_protocol(path)
+        if name in ("", "gen"):
+            return self._dir_entry(name)
         doc = self._resolve(path)
-        size = _reader_for(self._store, doc).size
         return {
-            "name": self._strip_protocol(path).strip("/"),
-            "size": size,
+            "name": name,
+            "size": self._reader(doc).size,
             "type": "file",
             "generation": doc.generation,
             "transport": doc.transport,
+            "etag": doc.payload_key,
         }
 
-    @override
-    def ls(self, path: str, detail: bool = True, **kwargs: Any) -> list[Any]:
-        """List the head and every extant generation marker."""
-        head_doc, _ = resolve_head(self._store)
-        names = ["head"] + [f"gen/{g}" for g in range(head_doc.generation + 1)]
-        entries: list[Any] = []
-        for name in names:
-            try:
-                entries.append(self.info(name) if detail else name)
-            except (ObjectNotFoundError, ExternalServiceError):
-                continue  # swept or unreadable generation — omit
-        return entries
+    def checksum(self, path: str) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]  # base returns int; stable str is strictly more useful and fsspec stringifies it
+        """Stable content identity — generations are immutable."""
+        return self._resolve(path).payload_key
 
-    @override
+    def ukey(self, path: str) -> str:
+        """Stable content identity for cache validity (same as checksum)."""
+        return self._resolve(path).payload_key
+
+    def ls(self, path: str = "", detail: bool = True, **kwargs: Any) -> list[Any]:
+        """List AT `path` (fsspec contract).
+
+        Root -> head + the gen/ directory; gen -> generation entries; a file
+        path -> that entry alone. Unreadable individual generations (swept payloads, corrupt
+        manifests) are omitted in BOTH detail modes; transport failures
+        propagate — an outage must not masquerade as an empty lake.
+        """
+        name = self._strip_protocol(path)
+        if name == "":
+            entries: list[dict[str, Any]] = []
+            with contextlib.suppress(FileNotFoundError):  # uninitialized lake
+                entries.append(self.info("head"))
+            entries.append(self._dir_entry("gen"))
+            return entries if detail else [e["name"] for e in entries]
+        if name == "gen":
+            try:
+                head_doc, _ = resolve_head(self._store)
+            except NotFoundError as exc:
+                raise FileNotFoundError(path) from exc
+            gens: list[dict[str, Any]] = []
+            for g in range(head_doc.generation + 1):
+                try:
+                    gens.append(self.info(f"gen/{g}"))
+                except (FileNotFoundError, InputValidationError):
+                    continue  # swept payload or corrupt manifest — omit
+            return gens if detail else [e["name"] for e in gens]
+        entry = self.info(name)  # a file path: [info(path)] per convention
+        return [entry] if detail else [entry["name"]]
+
     def exists(self, path: str, **kwargs: Any) -> bool:
-        """Whether the path names a resolvable generation."""
+        """Whether the path resolves.
+
+        Transport failures PROPAGATE — an S3 outage must not read as "the
+        lake does not exist".
+        """
+        name = self._strip_protocol(path)
+        if name in ("", "gen"):
+            return True
         try:
             self._resolve(path)
-        except (InputValidationError, ObjectNotFoundError, ExternalServiceError):
+        except FileNotFoundError:
             return False
         return True
 
+    def isdir(self, path: str) -> bool:
+        """Only the root and `gen` are directories."""
+        return self._strip_protocol(path) in ("", "gen")
+
+    def isfile(self, path: str) -> bool:
+        """Whether the path names a resolvable generation file."""
+        name = self._strip_protocol(path)
+        if name in ("", "gen"):
+            return False
+        return self.exists(path)
+
     # Read-only: every mutation entry point fails loudly.
-    def _readonly(self, *args: Any, **kwargs: Any) -> Any:
+
+    def _readonly(self, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportAny]  # signature-compatible stub for N inherited methods
         raise NotImplementedError("GenerationFileSystem is read-only")
 
     rm = _readonly
+    _rm = _readonly
     rm_file = _readonly
     mv = _readonly
+    cp_file = _readonly
     touch = _readonly
     mkdir = _readonly
     makedirs = _readonly
