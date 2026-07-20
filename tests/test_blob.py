@@ -60,7 +60,9 @@ def _root() -> RootDoc:
 
 
 def test_blob_commit_context_aborts_and_never_replays(tmp_path: Path) -> None:
-    ctx = blob._BlobCommit()  # pyright: ignore[reportPrivateUsage]
+    ctx = blob._BlobCommit(  # pyright: ignore[reportPrivateUsage]
+        store=InMemoryObjectStore(), chunk_threshold=None
+    )
     ctx.validate(tmp_path / "unused", _root())  # opaque bytes: no-op
     assert isinstance(ctx.decide_rebase(1, 5), Abort)
     with pytest.raises(AssertionError):

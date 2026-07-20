@@ -15,6 +15,7 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from ducklake_serverless import chunk
 from ducklake_serverless.engine import MAGIC, MAGIC_OFFSET
 from ducklake_serverless.errors import CatalogHygieneError
 from ducklake_serverless.models import format_payload_key
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     from pathlib import Path
     from uuid import UUID
 
+    from ducklake_serverless.models import RootDoc
     from ducklake_serverless.objectstore import ObjectStore
 
 # Catalogs hold metadata only; a file this large means runaway inlined data
@@ -48,14 +50,25 @@ class GenerationCache:
         self._workdir = workdir
         self._pristine: OrderedDict[str, Path] = OrderedDict()
 
-    def fetch_copy(self, generation: int, payload_uuid: UUID) -> Path:
-        """Return a private, mutable copy of the given generation's catalog."""
-        key = format_payload_key(generation, payload_uuid)
+    def fetch_copy(self, doc: RootDoc) -> Path:
+        """Return a private, mutable copy of the generation `doc` names.
+
+        Dispatches on the marker's transport: whole = one GET of the raw
+        bytes; chunked = fetch the manifest and reconstruct from packs
+        (parallel, hash-verified — see chunk.reconstruct). Either way the
+        pristine is the byte-identical payload; immutability makes the LRU
+        cache safe.
+        """
+        key = doc.payload_key
         pristine = self._pristine.get(key)
         if pristine is None or not pristine.exists():
-            result = self._store.get(key)
-            pristine = self._workdir / f"pristine-{generation:08d}-{payload_uuid}.duckdb"
-            pristine.write_bytes(result.body)
+            pristine = self._workdir / f"pristine-{doc.generation:08d}-{doc.payload_uuid}.duckdb"
+            match doc.transport:
+                case "whole":
+                    pristine.write_bytes(self._store.get(key).body)
+                case "chunked":
+                    manifest = chunk.load_manifest(self._store, key)
+                    chunk.reconstruct(self._store, manifest, pristine)
             self._pristine[key] = pristine
         self._pristine.move_to_end(key)
         while len(self._pristine) > PRISTINE_CACHE_SIZE:

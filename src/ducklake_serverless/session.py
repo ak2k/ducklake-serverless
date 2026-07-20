@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 from uuid import uuid4
 
-from ducklake_serverless import commit
+from ducklake_serverless import chunk, commit
 from ducklake_serverless.commit import writer_info
 from ducklake_serverless.engine import (
     DUCKDB_VERSION,
@@ -69,6 +69,14 @@ _PIN_DUCKLAKE_FORMAT = "ducklake_format_version"
 # it, one bulk download beats httpfs's ~16 range GETs (measured crossover is in
 # the tens of MB on a ~30ms-RTT link — see docs/benchmarks/httpfs-read-path.md).
 STREAM_MIN_BYTES = 32 * 1024 * 1024
+
+# Catalogs at least this large publish via the chunked transport by default.
+# Note the interaction with streaming: a chunked generation is not one
+# attachable object, so httpfs streaming only ever engages for WHOLE heads —
+# with default settings chunking takes over below STREAM_MIN_BYTES and
+# streaming never fires. Streaming remains for lakes that opt out of chunking
+# (chunk_threshold=None) while their catalogs grow large.
+DEFAULT_CHUNK_THRESHOLD = 16 * 1024 * 1024
 
 
 class Transaction:
@@ -122,6 +130,10 @@ class _DuckLakeCommit:
         GenerationCache.discard(stale_work)
         return self.lake.replay_onto_head(self.changeset)
 
+    def transport_policy(self, base: RootDoc) -> commit.TransportPolicy:
+        """Chunk large catalogs, deduping against the base's manifest."""
+        return self.lake.transport_policy(base)
+
 
 class Lake:
     """A serverless DuckLake rooted at one object-store prefix."""
@@ -135,12 +147,18 @@ class Lake:
         conflict_policy: ConflictPolicy = ConflictPolicy.APPEND_ONLY_REPLAY,
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         s3_credentials: S3Credentials | None = None,
+        chunk_threshold: int | None = DEFAULT_CHUNK_THRESHOLD,
     ) -> None:
         """Bind the lake to a store, a scratch dir, and a Parquet destination.
 
         `data_path` is where DuckDB writes Parquet — an s3:// URL in
         production, a local directory in hermetic tests. No trailing slash
         (upstream ducklake#815 misclassifies files under one as orphans).
+
+        `chunk_threshold`: catalogs at least this many bytes are published
+        via the chunked transport (content-addressed packs — see chunk.py);
+        smaller ones stay whole-file. None disables chunking entirely; 0
+        chunks always. Whole-file generations remain httpfs-streamable.
         """
         self._store = store
         self._workdir = workdir
@@ -149,6 +167,16 @@ class Lake:
         self.conflict_policy = conflict_policy
         self._max_attempts = max_attempts
         self._s3_credentials = s3_credentials
+        self._chunk_threshold = chunk_threshold
+
+    def transport_policy(self, base: RootDoc) -> commit.TransportPolicy:
+        """Chunking policy for a commit onto `base` (dedup source = base only)."""
+        base_manifest = None
+        if base.transport == "chunked":
+            base_manifest = chunk.load_manifest(self._store, base.payload_key)
+        return commit.TransportPolicy(
+            chunk_threshold=self._chunk_threshold, base_manifest=base_manifest
+        )
 
     def bootstrap(self, *, verify_backend: bool = True) -> RootDoc:
         """Create generation 0 (an empty DuckLake catalog) and its marker.
@@ -290,7 +318,7 @@ class Lake:
             base, _ = resolve_head(self._store)
             self._check_versions(base)
             try:
-                return base, self._cache.fetch_copy(base.generation, base.payload_uuid)
+                return base, self._cache.fetch_copy(base)
             except ObjectNotFoundError:
                 continue
         raise ExternalServiceError(
@@ -375,11 +403,21 @@ class Lake:
             if stream is True:
                 raise ExternalServiceError("streaming reads require s3_credentials for httpfs")
             return None  # auto with no creds → download
+        base, _ = resolve_head(store)
+        if base.transport != "whole":
+            # A chunked generation is a manifest, not one attachable object —
+            # httpfs cannot stream it. The transport gate precedes the size
+            # heuristic (a manifest's small size would silently mask this).
+            if stream is True:
+                raise ExternalServiceError(
+                    "streaming reads require a whole-file head; the current "
+                    "generation is chunked — use the download reader"
+                )
+            return None  # auto on a chunked head → download (reconstruct)
         if stream is True:
             return store
-        base, _ = resolve_head(store)  # auto: only stream a large catalog
         key = format_payload_key(base.generation, base.payload_uuid)
-        return store if store.size(key) >= STREAM_MIN_BYTES else None
+        return store if store.head_meta(key).size >= STREAM_MIN_BYTES else None
 
     def _open_streaming_reader(self, store: S3ObjectStore) -> LakeConnection:
         """Attach the current head's catalog directly from S3 (httpfs), no download.
@@ -391,6 +429,13 @@ class Lake:
         for _ in range(self._max_attempts):
             base, _ = resolve_head(store)
             self._check_versions(base)
+            if base.transport != "whole":
+                # The head flipped to a chunked generation since the stream
+                # decision — a manifest is not attachable; refuse loudly.
+                raise ExternalServiceError(
+                    "streaming reads require a whole-file head; the current "
+                    "generation is chunked — use the download reader"
+                )
             uri = store.s3_uri(format_payload_key(base.generation, base.payload_uuid))
             try:
                 return LakeConnection(

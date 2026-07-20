@@ -12,7 +12,7 @@ from ducklake_serverless.errors import ConflictAbortError, InputValidationError
 from ducklake_serverless.gc import maintain_data
 from ducklake_serverless.lease import Lease
 from ducklake_serverless.models import ROOTS_PREFIX
-from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore
+from ducklake_serverless.objectstore import GetResult, InMemoryObjectStore, ObjectMeta
 from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 from tests.conftest import lake_churn as churn
@@ -202,9 +202,7 @@ def test_pinned_reader_within_contract_survives_maintenance(
 
     verify = Lake(store, workdir=tmp_path / "pin", data_path=str(tmp_path / "data"))
     (tmp_path / "pin").mkdir()
-    path = verify._cache.fetch_copy(  # pyright: ignore[reportPrivateUsage]
-        pinned_root.generation, pinned_root.payload_uuid
-    )
+    path = verify._cache.fetch_copy(pinned_root)  # pyright: ignore[reportPrivateUsage]
     con = LakeConnection(path, data_path=None, read_only=True)
     # Value-forcing read through the PINNED generation's catalog.
     assert con.execute("SELECT count(*), sum(id) FROM t") == [(50000, 1249975000)]
@@ -254,6 +252,12 @@ def test_lost_cas_after_physical_deletes_stays_consistent(
 
         def list_prefix(self, prefix: str) -> list[str]:
             return self._inner.list_prefix(prefix)
+
+        def list_meta(self, prefix: str) -> list[ObjectMeta]:
+            return self._inner.list_meta(prefix)
+
+        def head_meta(self, key: str) -> ObjectMeta:
+            return self._inner.head_meta(key)
 
         def put(self, key: str, body: bytes) -> str:
             return self._inner.put(key, body)

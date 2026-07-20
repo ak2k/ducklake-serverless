@@ -11,11 +11,12 @@ purely through `commit`, `models`, and `root`, which is the whole point.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from ducklake_serverless import commit
+from ducklake_serverless import chunk, commit
 from ducklake_serverless.models import Abort, RootDoc, format_payload_key
 from ducklake_serverless.root import MarkerOutcome, read_marker, resolve_head, write_hint
 
@@ -27,9 +28,17 @@ if TYPE_CHECKING:
 
 DEFAULT_MAX_ATTEMPTS = 5
 
+# Blobs at least this large publish via the chunked transport (dedup against
+# the previous generation + parallel reconstruct). Smaller blobs stay whole.
+DEFAULT_CHUNK_THRESHOLD = 16 * 1024 * 1024
 
+
+@dataclass(frozen=True)
 class _BlobCommit:
     """The trivial `commit.CommitContext` for an opaque blob."""
+
+    store: ObjectStore
+    chunk_threshold: int | None
 
     def validate(self, work: Path, base: RootDoc) -> None:
         """Nothing to check — the bytes are opaque to the engine."""
@@ -42,16 +51,31 @@ class _BlobCommit:
         """Unreachable: `decide_rebase` never returns Replay for a blob."""
         raise AssertionError("blob commits never replay")
 
+    def transport_policy(self, base: RootDoc) -> commit.TransportPolicy:
+        """Chunk large blobs, deduping against the base generation's manifest."""
+        base_manifest = None
+        if base.transport == "chunked":
+            base_manifest = chunk.load_manifest(self.store, base.payload_key)
+        return commit.TransportPolicy(
+            chunk_threshold=self.chunk_threshold, base_manifest=base_manifest
+        )
+
 
 class BlobStore:
     """A single versioned blob rooted at one object-store prefix."""
 
     def __init__(
-        self, store: ObjectStore, workdir: Path, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS
+        self,
+        store: ObjectStore,
+        workdir: Path,
+        *,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        chunk_threshold: int | None = DEFAULT_CHUNK_THRESHOLD,
     ) -> None:
         self._store = store
         self._workdir = workdir
         self._max_attempts = max_attempts
+        self._chunk_threshold = chunk_threshold
 
     def bootstrap(self, initial: bytes = b"", *, verify_backend: bool = True) -> RootDoc:
         """Create generation 0 from `initial` bytes and its marker.
@@ -85,9 +109,19 @@ class BlobStore:
         return base
 
     def read(self) -> bytes:
-        """The current generation's bytes."""
+        """The current generation's bytes (reconstructed when chunked)."""
         base, _ = resolve_head(self._store)
-        return self._store.get(base.payload_key).body
+        match base.transport:
+            case "whole":
+                return self._store.get(base.payload_key).body
+            case "chunked":
+                manifest = chunk.load_manifest(self._store, base.payload_key)
+                dest = self._workdir / f"read-{uuid4()}"
+                try:
+                    chunk.reconstruct(self._store, manifest, dest)
+                    return dest.read_bytes()
+                finally:
+                    dest.unlink(missing_ok=True)
 
     def write(self, data: bytes) -> CommitResult:
         """Commit `data` wholesale as the next generation.
@@ -98,7 +132,8 @@ class BlobStore:
         base, _ = resolve_head(self._store)
         work = self._workdir / f"blob-{uuid4()}"
         work.write_bytes(data)
+        ctx = _BlobCommit(store=self._store, chunk_threshold=self._chunk_threshold)
         try:
-            return commit.run_commit(self._store, base, work, _BlobCommit(), self._max_attempts)
+            return commit.run_commit(self._store, base, work, ctx, self._max_attempts)
         finally:
             work.unlink(missing_ok=True)

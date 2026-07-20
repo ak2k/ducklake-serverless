@@ -10,7 +10,11 @@ Contract for agents working in this repo. Read first; overrides defaults.
 | `duckdb` behind a typed facade | duckdb's Python API is loosely typed; basedpyright suppressions live only in `engine.py` (same treatment the template gives structlog). No other module imports duckdb. |
 | Sync core, no `anyio` | The commit path is inherently sequential (fetch → attach → SQL → detach → upload → CAS) and duckdb's API is sync. Parallelism in this system lives BETWEEN processes, arbitrated by S3 CAS — not inside one. An anyio wrapper may come later for consumers; the protocol core stays sync. |
 
-Protocol invariants agents must not weaken (see `docs/` and the plan):
+Protocol invariants agents must not weaken — the CONSOLIDATED list, the
+failure asymmetry (every ambiguity resolves toward availability, never
+durability), and the accepted residual risks live in
+[`docs/DESIGN.md`](docs/DESIGN.md). Read it before touching `gc.py`,
+`chunk.py`, or `commit.py`. Highlights:
 
 - A commit is the create-only PUT of an immutable per-generation marker
   `roots/<gen>` (`If-None-Match: *`). Exactly one body ever exists per
@@ -42,6 +46,14 @@ Protocol invariants agents must not weaken (see `docs/` and the plan):
 - S3 clients SHOULD disable transport retries (`make_s3_client`); with markers
   the own-write evidence is immortal, so a self-412 from an SDK retry resolves
   WON — but disabling retries keeps the resolution path simple.
+
+- Chunked transport (see docs/DESIGN.md for the full list): manifest
+  entries are FULL and the dedup source is strictly the base manifest —
+  both load-bearing for the GC mark induction. Pack deletion is two-cycle
+  tombstone with a fenced ledger write as the commit point. Transport is
+  marker-declared; readers never content-sniff. All age gates compare
+  store-issued timestamps; MIN_PACK_GRACE is load-bearing twice (stalled
+  writers AND store-clock second-granularity).
 
 ## Stack (one per concern; substitutes are bans)
 

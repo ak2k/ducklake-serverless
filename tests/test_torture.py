@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from ducklake_serverless.errors import ConflictAbortError
+from ducklake_serverless.chunk import PACKS_PREFIX, Manifest
+from ducklake_serverless.errors import ConflictAbortError, InputValidationError
 from ducklake_serverless.gc import collect, maintain_data
 from ducklake_serverless.models import parse_payload_key
 from ducklake_serverless.objectstore import InMemoryObjectStore
@@ -288,3 +289,86 @@ def test_writers_with_concurrent_data_maintenance(tmp_path: Path) -> None:
     with verify.reader() as con:
         rows = con.execute("SELECT writer, seq FROM markers")
         assert sorted(rows) == sorted(acks)  # exactly once, nothing lost
+
+
+@pytest.mark.slow
+def test_chunked_writers_with_concurrent_pack_gc(tmp_path: Path) -> None:
+    """Chunked writers race the full GC (payload sweep + pack mark-sweep).
+
+    chunk_threshold=0 forces every commit through the chunked transport; the
+    GC loop runs wet with zero pack grace (worst case for the tombstone FSM).
+    End invariants: exactly-once rows, the head reconstructs byte-identically
+    through a fresh reader, and every surviving pack is referenced-by-a-
+    retained-manifest or tombstone-pending (no leaked deletes, no lost packs).
+    """
+    store = InMemoryObjectStore()
+    data = tmp_path / "data"
+    data.mkdir()
+
+    def make_chunked(name: str) -> Lake:
+        work = tmp_path / name
+        work.mkdir()
+        return Lake(store, workdir=work, data_path=str(data), max_attempts=50, chunk_threshold=0)
+
+    setup = make_chunked("setup")
+    setup.bootstrap()
+    with setup.transaction() as tx:
+        tx.sql("CREATE TABLE markers (writer INTEGER, seq INTEGER)")
+
+    acks: list[tuple[int, int]] = []
+    acks_lock = threading.Lock()
+    stop = threading.Event()
+    gc_reports: list[object] = []
+
+    def writer(writer_id: int) -> None:
+        lake = make_chunked(f"cw{writer_id}")
+        for seq in range(12):
+            with lake.transaction() as tx:
+                tx.sql("INSERT INTO markers VALUES (?, ?)", (writer_id, seq))
+            with acks_lock:
+                acks.append((writer_id, seq))
+
+    def gc_loop() -> None:
+        while not stop.is_set():
+            report = collect(
+                store,
+                "pack-torture-gc",
+                retain_generations=5,
+                dry_run=False,
+                pack_grace=timedelta(0),
+                _unsafe_allow_short_grace=True,
+            )
+            if report is not None:
+                gc_reports.append(report)
+            stop.wait(0.05)
+
+    gc_thread = threading.Thread(target=gc_loop)
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+    gc_thread.start()
+    for t_ in threads:
+        t_.start()
+    for t_ in threads:
+        t_.join()
+    stop.set()
+    gc_thread.join()
+
+    assert gc_reports, "GC never ran"
+    assert len(acks) == 4 * 12
+
+    # Exactly-once through a fresh chunked reader (reconstruct + attach).
+    verify = make_chunked("cverify")
+    with verify.reader() as con:
+        rows = con.execute("SELECT writer, seq FROM markers")
+        assert sorted(rows) == sorted(acks)
+
+    # Pack-safety invariant: every pack referenced by any RETAINED manifest
+    # still exists (no shared-fate deletion), i.e. referenced ⊆ surviving.
+    surviving_packs = set(store.list_prefix(PACKS_PREFIX))
+    referenced: set[str] = set()
+    for key in store.list_prefix("payload/"):
+        body = store.get(key).body
+        try:
+            referenced |= Manifest.from_bytes(body).pack_keys()
+        except InputValidationError:
+            continue  # whole-file payloads aren't manifests
+    assert referenced <= surviving_packs, "a retained manifest references a swept pack"

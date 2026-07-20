@@ -102,6 +102,11 @@ class RootDoc(BaseModel):
     # writer can refuse a silent format migration. Empty for an opaque blob;
     # the engine never interprets these — only the payload adapter does.
     pins: dict[str, str] = Field(default_factory=dict)
+    # How the payload object stores its bytes: raw ("whole") or as a chunk
+    # manifest ("chunked" — see chunk.py). Engine-owned; readers dispatch on
+    # this, never on content sniffing. Set explicitly per commit from the
+    # publish outcome — NEVER inherited from the base generation's marker.
+    transport: Literal["whole", "chunked"] = "whole"
 
     @property
     def payload_key(self) -> str:
@@ -114,8 +119,15 @@ class RootDoc(BaseModel):
         return format_marker_key(self.generation)
 
     def to_json_bytes(self) -> bytes:
-        """Serialize for the marker object body (schema field aliased)."""
-        return self.model_dump_json(by_alias=True).encode()
+        """Serialize for the marker object body (schema field aliased).
+
+        `transport` is written only when non-default ("chunked"): RootDoc is
+        extra="forbid", so an old reader hard-fails on a chunked marker (it
+        genuinely cannot read that generation) while whole-file markers stay
+        byte-compatible with pre-transport readers.
+        """
+        exclude = {"transport"} if self.transport == "whole" else None
+        return self.model_dump_json(by_alias=True, exclude=exclude).encode()
 
     @classmethod
     def from_json_bytes(cls, data: bytes) -> RootDoc:
