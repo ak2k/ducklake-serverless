@@ -69,9 +69,14 @@ DEFAULT_PHYSICAL_DELAY = timedelta(days=1)
 # their manifest lands. A tombstoned pack must then STAY cold this long again
 # before deletion, so total time-to-delete ≈ 2x grace across ≥2 GC runs.
 DEFAULT_PACK_GRACE = timedelta(hours=24)
-# Floor for non-dry-run pack deletion, mirroring MIN_PHYSICAL_DELAY: below
-# this the grace cannot be trusted to outlast a stalled writer's
-# packs-landed→manifest-landed gap.
+# Floor for non-dry-run pack deletion, mirroring MIN_PHYSICAL_DELAY. Two
+# things lean on it: (1) the grace must outlast a stalled writer's
+# packs-landed→manifest-landed gap; (2) every age comparison here is between
+# store-issued timestamps that real stores truncate to WHOLE SECONDS
+# (verified against SeaweedFS; S3 likewise) — a ~1-2s error that reads
+# objects slightly older than they are. Against a 1h floor that erosion is
+# 0.05%; against a seconds-scale grace it would be the whole margin. Do not
+# lower this floor on the theory that granularity is handled elsewhere.
 MIN_PACK_GRACE = timedelta(hours=1)
 
 # Mass-delete circuit breaker: refuse a sweep that would delete more than
