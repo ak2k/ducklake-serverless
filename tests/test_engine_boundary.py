@@ -20,6 +20,7 @@ import pytest
 # duckdb and are excluded.)
 ENGINE_CORE = [
     "chunk",
+    "fsspec_fs",
     "commit",
     "blob",
     "models",

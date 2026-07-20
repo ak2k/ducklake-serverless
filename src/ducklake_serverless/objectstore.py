@@ -87,6 +87,14 @@ class ObjectStore(Protocol):
         """Fetch an object body and its ETag."""
         ...
 
+    def get_range(self, key: str, start: int, length: int) -> bytes:
+        """Fetch `length` bytes at `start` (S3 Range GET).
+
+        Returns fewer bytes only when the range extends past the object
+        (empty when `start` is at/past EOF). ObjectNotFoundError if absent.
+        """
+        ...
+
     def put_if_absent(self, key: str, body: bytes) -> str:
         """Create-only PUT: new ETag, or PreconditionFailedError if the key exists."""
         ...
@@ -153,6 +161,24 @@ class S3ObjectStore:
             etag=resp["ETag"].strip('"'),
             last_modified=resp.get("LastModified"),
         )
+
+    def get_range(self, key: str, start: int, length: int) -> bytes:
+        """Ranged GET — the selective-read primitive (fsspec adapter)."""
+        if length <= 0:
+            return b""
+        try:
+            resp = self._client.get_object(
+                Bucket=self._bucket,
+                Key=self._full(key),
+                Range=f"bytes={start}-{start + length - 1}",
+            )
+        except botocore.exceptions.ClientError as exc:
+            if _error_code(exc) in ("NoSuchKey", "404"):
+                raise ObjectNotFoundError(key) from exc
+            if _error_code(exc) == "InvalidRange":
+                return b""  # start past EOF: empty, matching file semantics
+            raise ExternalServiceError(f"get_range {key!r}") from exc
+        return resp["Body"].read()
 
     def put_if_absent(self, key: str, body: bytes) -> str:
         """Create-only PUT via `If-None-Match: *`."""
@@ -467,6 +493,17 @@ class InMemoryObjectStore:
             except KeyError:
                 raise ObjectNotFoundError(key) from None
             return GetResult(body=body, etag=etag, last_modified=written)
+
+    def get_range(self, key: str, start: int, length: int) -> bytes:
+        """Ranged read with S3 semantics (empty past EOF, truncated at EOF)."""
+        with self._lock:
+            try:
+                body, _, _ = self._objects[key]
+            except KeyError:
+                raise ObjectNotFoundError(key) from None
+            if length <= 0:
+                return b""
+            return body[start : start + length]
 
     def put_if_absent(self, key: str, body: bytes) -> str:
         """Create-only PUT; fails if the key already exists."""
