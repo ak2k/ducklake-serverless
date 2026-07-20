@@ -141,7 +141,9 @@ Availability-side by construction; revisit triggers noted.
   property, forced multi-window/back-ref reconstruct).
 - Interleavings and injected faults: wrapper stores in `test_pack_gc.py` /
   `test_fault_injection.py` (GC-strikes-in-the-gap heal, rival ledger
-  write fence, ambiguous pack PUTs).
+  write fence — all three LedgerRef branches: If-Match, both-see-absent
+  create race, corrupt-ledger replacement — ambiguous pack PUTs, transient
+  refresh-PUT blips).
 - Concurrency: `tests/test_torture.py` chunked writers-vs-GC variant
   (exactly-once, byte-identical head, referenced ⊆ surviving).
 - Real-store semantics: `tests/test_integration_minio.py`
