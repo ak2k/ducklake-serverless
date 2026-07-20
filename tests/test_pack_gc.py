@@ -456,3 +456,64 @@ def test_empty_payload_chunked_commit(tmp_path: Path) -> None:
     bs.bootstrap(b"seed")
     bs.write(b"")  # empty: zero chunks, zero packs — must still commit
     assert bs.read() == b""
+
+
+class RivalLedgerWrite(InMemoryObjectStore):
+    """A rival GC cycle rewrites the tombstone ledger between this cycle's
+    load (GET) and its fenced commit (put_if_match) — the stale cycle must
+    abort with zero pack deletes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+
+    @override
+    def get(self, key: str):
+        result = super().get(key)
+        if self.armed and key == gc_mod._TOMBSTONE_KEY:  # pyright: ignore[reportPrivateUsage]
+            self.armed = False
+            # Rival cycle commits a different ledger AFTER our read.
+            super().put(
+                gc_mod._TOMBSTONE_KEY,  # pyright: ignore[reportPrivateUsage]
+                TombstoneDoc(cold_since={}).to_json_bytes(),
+            )
+        return result
+
+
+def test_stale_gc_cycle_fenced_by_ledger_etag(tmp_path: Path) -> None:
+    """The ledger ETag is a fencing token: a cycle whose decision is stale
+    (rival ledger write interleaved) aborts before ANY delete."""
+    store = RivalLedgerWrite()
+    work = tmp_path / "w"
+    work.mkdir()
+    bs = BlobStore(store, work, chunk_threshold=0)  # pyright: ignore[reportArgumentType]
+    bs.bootstrap(b"g0")
+    bs.write(payload(1))
+    for seed in range(2, 6):
+        bs.write(payload(seed))
+
+    # Cycle 1: creates the ledger with tombstones (rival not armed yet).
+    r1 = gc_mod.collect(
+        store,
+        "gc",
+        retain_generations=1,
+        dry_run=False,
+        pack_grace=timedelta(0),
+        _unsafe_allow_short_grace=True,
+    )
+    assert r1 is not None and r1.tombstoned_packs
+    plant_aged_tombstones(store, set(r1.tombstoned_packs))
+    packs_before = set(store.list_prefix(PACKS_PREFIX))
+
+    # Cycle 2 would delete — but the rival interleaves at ledger load.
+    store.armed = True
+    with pytest.raises(ExternalServiceError, match="rival GC runner"):
+        gc_mod.collect(
+            store,
+            "gc",
+            retain_generations=1,
+            dry_run=False,
+            pack_grace=timedelta(0),
+            _unsafe_allow_short_grace=True,
+        )
+    assert set(store.list_prefix(PACKS_PREFIX)) == packs_before  # ZERO deletes

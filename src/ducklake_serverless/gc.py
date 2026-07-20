@@ -36,9 +36,11 @@ from ducklake_serverless.chunk import (
     sniff_manifest,
 )
 from ducklake_serverless.errors import (
+    ConditionalConflictError,
     ExternalServiceError,
     InputValidationError,
     ObjectNotFoundError,
+    PreconditionFailedError,
 )
 from ducklake_serverless.lease import Lease
 from ducklake_serverless.models import (
@@ -500,14 +502,63 @@ def _store_now(store: ObjectStore) -> datetime:
     return probed
 
 
-def _load_tombstones(store: ObjectStore) -> TombstoneDoc:
+@dataclass(frozen=True)
+class LedgerAbsent:
+    """No ledger object exists — commit via create-only PUT."""
+
+
+@dataclass(frozen=True)
+class LedgerCorrupt:
+    """A ledger object exists but failed validation — replace it outright."""
+
+
+@dataclass(frozen=True)
+class LedgerAt:
+    """A valid ledger was read at this ETag — commit fenced via If-Match."""
+
+    etag: str
+
+
+# The fencing token for the ledger write-back: proves no other GC cycle
+# touched the ledger between our read and our commit point — structural
+# protection against a stale runner whose lease expired mid-cycle, instead
+# of an inductive argument about which interleavings happen to be harmless.
+LedgerRef = LedgerAbsent | LedgerCorrupt | LedgerAt
+
+
+def _load_tombstones(store: ObjectStore) -> tuple[TombstoneDoc, LedgerRef]:
+    """The ledger and the fencing reference for its conditional write-back."""
     try:
-        return TombstoneDoc.from_json_bytes(store.get(_TOMBSTONE_KEY).body)
+        result = store.get(_TOMBSTONE_KEY)
+        return TombstoneDoc.from_json_bytes(result.body), LedgerAt(etag=result.etag)
     except ObjectNotFoundError:
-        return TombstoneDoc()
+        return TombstoneDoc(), LedgerAbsent()
     except InputValidationError:
         # A corrupt ledger resets coldness — packs wait extra cycles (safe).
-        return TombstoneDoc()
+        return TombstoneDoc(), LedgerCorrupt()
+
+
+def _commit_tombstones(store: ObjectStore, doc: TombstoneDoc, ref: LedgerRef) -> None:
+    """Write the ledger fenced on the reference read at load; abort on a rival.
+
+    A conditional-write failure means another GC cycle wrote the ledger since
+    our read — our whole decision is stale. Raising BEFORE any delete aborts
+    the cycle with zero deletes; the next holder re-decides from fresh state.
+    """
+    body = doc.to_json_bytes()
+    try:
+        match ref:
+            case LedgerAbsent():
+                store.put_if_absent(_TOMBSTONE_KEY, body)
+            case LedgerCorrupt():
+                store.put(_TOMBSTONE_KEY, body)  # replacing garbage: no fence to hold
+            case LedgerAt(etag=etag):
+                store.put_if_match(_TOMBSTONE_KEY, body, etag)
+    except (PreconditionFailedError, ConditionalConflictError, ObjectNotFoundError) as exc:
+        raise ExternalServiceError(
+            "tombstone ledger changed since this cycle read it — a rival GC "
+            "runner interleaved (expired lease?); aborting with zero deletes"
+        ) from exc
 
 
 def _pack_sweep(
@@ -550,7 +601,7 @@ def _pack_sweep(
         with contextlib.suppress(ObjectNotFoundError):  # decide_pack_sweep refuses on it
             pack_metas.append(store.head_meta(key))
 
-    tombstones = _load_tombstones(store)
+    tombstones, ledger_ref = _load_tombstones(store)
     # One store-clock probe per cycle (in dry-run it is the cycle's only
     # write): every age comparison in the decision shares this instant.
     store_now = _store_now(store)
@@ -583,7 +634,7 @@ def _pack_sweep(
         new_cold[key] = store_now
     for key in plan.delete:
         new_cold.pop(key, None)
-    store.put(_TOMBSTONE_KEY, TombstoneDoc(cold_since=new_cold).to_json_bytes())
+    _commit_tombstones(store, TombstoneDoc(cold_since=new_cold), ledger_ref)
 
     swept = _delete_cold_packs(store, lease, sorted(plan.delete), grace)
     return _PackReport(
