@@ -96,7 +96,12 @@ class ObjectStore(Protocol):
         ...
 
     def put(self, key: str, body: bytes) -> str:
-        """Unconditional PUT (last-writer-wins): new ETag. For advisory objects only."""
+        """Unconditional PUT (last-writer-wins): new ETag.
+
+        For writes where last-writer-wins IS the semantics: the advisory
+        hint, pack refresh-PUTs (identical bytes; the mtime bump is the
+        point), the GC clock probe, and corrupt-ledger replacement.
+        """
         ...
 
     def list_prefix(self, prefix: str) -> list[str]:
@@ -182,10 +187,12 @@ class S3ObjectStore:
         return resp["ETag"].strip('"')
 
     def put(self, key: str, body: bytes) -> str:
-        """Unconditional PUT — advisory objects (the hint) only.
+        """Unconditional PUT — for writes where last-writer-wins IS the semantics.
 
-        No conditional header, so no ambiguity to resolve: on a transport
-        failure the caller simply moves on (the hint is best-effort).
+        The advisory hint, pack refresh-PUTs (identical bytes; the mtime bump
+        is the point), the GC clock probe, and corrupt-ledger replacement.
+        No conditional header, so no ambiguity to resolve: a transport
+        failure surfaces as ExternalServiceError and the caller decides.
         """
         try:
             resp = self._client.put_object(Bucket=self._bucket, Key=self._full(key), Body=body)

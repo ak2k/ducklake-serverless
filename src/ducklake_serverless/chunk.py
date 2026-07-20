@@ -320,12 +320,23 @@ def verify_packs(
       reconstructed. A present-but-tombstoned base pack needs no refresh:
       it is referenced by the still-retained base manifest, so the mark
       pass resurrects its tombstone.
+
+    Residual window, accepted: S3 has no conditional DELETE, so a refresh-PUT
+    landing inside GC's ms-scale re-HEAD→DELETE gap — while the writer had
+    ALSO already stalled a full grace AND its packs sat tombstoned a full
+    prior cycle — still loses. This narrows the exposure from unbounded to
+    (stall > 2x grace) ∧ (ms-race), strictly stronger than grace-only
+    (Delta VACUUM / Iceberg remove_orphan_files); it does not close it.
     """
 
     def check(key: str) -> None:
         sha = parse_pack_key(key)
         body = novel.get(sha)
         if body is not None:
+            if hashlib.sha256(body).hexdigest() != sha:
+                # The unconditional PUT below could clobber a SHARED pack
+                # other generations reference; never trust the caller's map.
+                raise ExternalServiceError(f"novel pack map corrupt: bytes do not hash to {sha}")
             # Unconditional PUT, not create-only: the mtime refresh is the
             # point (put_pack's 412-is-success would leave a stale mtime).
             store.put(key, body)
@@ -390,6 +401,11 @@ def reconstruct(
 
     def write_windows(out: BinaryIO, hasher: HashLike) -> None:
         entry_index = 0
+        # One-slot memo for back-references to already-released windows: an
+        # internally-duplicated payload (region B == region A) back-refs A's
+        # packs for consecutive entries; without the memo each entry would
+        # re-fetch the full pack (~128x byte amplification at defaults).
+        back_ref: tuple[str, bytes] | None = None
         for start in range(0, len(ordered), RECONSTRUCT_WINDOW_PACKS):
             window = ordered[start : start + RECONSTRUCT_WINDOW_PACKS]
             with ThreadPoolExecutor(max_workers=min(max_workers, len(window))) as pool:
@@ -402,7 +418,9 @@ def reconstruct(
                 if body is None:
                     if position[entry.pack_sha256] >= start + len(window):
                         break  # pack belongs to a LATER window — advance
-                    _, body = fetch(entry.pack_sha256)  # rare back-reference
+                    if back_ref is None or back_ref[0] != entry.pack_sha256:
+                        back_ref = fetch(entry.pack_sha256)
+                    body = back_ref[1]
                 piece = body[entry.pack_offset : entry.pack_offset + entry.length]
                 if len(piece) != entry.length:
                     raise ExternalServiceError(

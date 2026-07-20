@@ -295,3 +295,61 @@ def test_property_edit_roundtrip(
     # the payload length changed).
     budget = sum(512 + len(p) + 512 for _, p in edits) + abs(len(edited) - len(data)) + 512
     assert novel <= budget
+
+
+def test_windowed_reconstruct_multi_window_and_back_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """H1 regression: exercise the windowed reconstruct's REAL machinery —
+    multi-window iteration, the forward-break branch, and back-references to
+    already-released windows (internally-duplicated payload: region B == A,
+    so B's entries reference packs from A's long-released windows).
+
+    Window forced to 2 so a modest payload spans many windows.
+    """
+    monkeypatch.setattr(chunk, "RECONSTRUCT_WINDOW_PACKS", 2)
+    store = InMemoryObjectStore()
+
+    # Region A: 16 distinct 1024-byte chunks -> 8 packs of 2 chunks each at
+    # pack_target 2048. Payload = A + A: the duplicate region's chunks dedup
+    # INTRA-manifest via gen2's build against gen1 (base-only dedup means gen1
+    # itself carries duplicate entries pointing at the same packs — exactly
+    # the back-reference shape).
+    region = b"".join(bytes([i]) * 1024 for i in range(16))
+    data = region + region  # 32 KiB, heavy internal duplication
+    src = tmp_path / "f"
+    src.write_bytes(data)
+    m1, packs1 = build_manifest(src, None, chunk_size=1024, pack_target=2048)
+    publish_packs(store, packs1)
+    assert len({e.pack_sha256 for e in m1.entries}) > 4  # spans >2 windows
+
+    dest = tmp_path / "dest"
+    reconstruct(store, m1, dest)
+    assert dest.read_bytes() == data  # byte-identity across windows+back-refs
+
+    # Second generation deduped against m1: every chunk reuses m1's packs;
+    # scattered edits force interleaved window/back-ref traffic.
+    edited = bytearray(data)
+    for pos in range(0, len(edited), 7000):
+        edited[pos] = (edited[pos] + 1) % 256
+    src.write_bytes(bytes(edited))
+    m2, packs2 = build_manifest(src, m1, chunk_size=1024, pack_target=2048)
+    publish_packs(store, packs2)
+    dest2 = tmp_path / "dest2"
+    reconstruct(store, m2, dest2)
+    assert dest2.read_bytes() == bytes(edited)
+
+
+def test_verify_packs_rejects_corrupt_novel_map(tmp_path: Path) -> None:
+    """L1 regression: the unconditional refresh-PUT must never clobber a
+    shared pack with bytes that don't hash to its key."""
+    store = InMemoryObjectStore()
+    src = tmp_path / "f"
+    src.write_bytes(b"x" * 4096)
+    manifest, packs = build_manifest(src, None, chunk_size=1024, pack_target=8192)
+    publish_packs(store, packs)
+    good = store.get(format_pack_key(packs[0][0])).body
+    corrupt = {packs[0][0]: b"wrong bytes"}
+    with pytest.raises(ExternalServiceError, match="corrupt"):
+        verify_packs(store, manifest, corrupt)
+    assert store.get(format_pack_key(packs[0][0])).body == good  # untouched
