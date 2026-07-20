@@ -202,9 +202,7 @@ def test_pinned_reader_within_contract_survives_maintenance(
 
     verify = Lake(store, workdir=tmp_path / "pin", data_path=str(tmp_path / "data"))
     (tmp_path / "pin").mkdir()
-    path = verify._cache.fetch_copy(  # pyright: ignore[reportPrivateUsage]
-        pinned_root.generation, pinned_root.payload_uuid
-    )
+    path = verify._cache.fetch_copy(pinned_root)  # pyright: ignore[reportPrivateUsage]
     con = LakeConnection(path, data_path=None, read_only=True)
     # Value-forcing read through the PINNED generation's catalog.
     assert con.execute("SELECT count(*), sum(id) FROM t") == [(50000, 1249975000)]

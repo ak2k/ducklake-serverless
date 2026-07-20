@@ -117,7 +117,7 @@ def test_reader_pinned_inside_window_survives_gc(
     # The pinned generation must still be fetchable and attachable.
     verify = Lake(store, workdir=tmp_path / "pinned", data_path=str(tmp_path / "data"))
     (tmp_path / "pinned").mkdir()
-    path = verify._cache.fetch_copy(pinned.generation, pinned.payload_uuid)  # pyright: ignore[reportPrivateUsage]
+    path = verify._cache.fetch_copy(pinned)  # pyright: ignore[reportPrivateUsage]
     con = LakeConnection(path, data_path=None, read_only=True)
     rows = con.execute("SELECT count(*) FROM t")
     assert rows == [(5,)]  # the state as of the pinned generation

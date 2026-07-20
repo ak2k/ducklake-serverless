@@ -27,7 +27,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID, uuid4
 
-from ducklake_serverless import __version__
+from ducklake_serverless import __version__, chunk
 from ducklake_serverless.errors import (
     AmbiguousCasError,
     BackendUnsafeError,
@@ -63,8 +63,23 @@ _BACKOFF_BASE_S = 0.05
 _BACKOFF_CAP_S = 2.0
 
 
+@dataclass(frozen=True)
+class TransportPolicy:
+    """When and how a commit uses the chunked transport.
+
+    `chunk_threshold=None` means never chunk (whole-file always); `0` means
+    always chunk. Between: payloads at least the threshold are chunked.
+    `base_manifest` is the BASE generation's manifest when the base itself is
+    chunked — the ONLY legal dedup source (load-bearing for GC; see chunk.py).
+    """
+
+    chunk_threshold: int | None = None
+    base_manifest: chunk.Manifest | None = None
+    pack_target: int = chunk.DEFAULT_PACK_TARGET
+
+
 class CommitContext(Protocol):
-    """The three payload-specific hooks the generic commit loop needs.
+    """The payload-specific hooks the generic commit loop needs.
 
     A `Lake` builds one of these per transaction, closing over whatever the
     payload's rebase needs (for DuckLake, the recorded SQL changeset). A plain
@@ -91,6 +106,14 @@ class CommitContext(Protocol):
         Called only when `decide_rebase` returned `Replay`. Returns the current
         head marker and a fresh work copy with the change re-applied, ready to
         publish as head+1.
+        """
+        ...
+
+    def transport_policy(self, base: RootDoc) -> TransportPolicy:
+        """Chunking policy for this commit, given the base being built upon.
+
+        The context owns fetching the base's manifest when the base is chunked
+        (it already holds the store and the base doc's transport).
         """
         ...
 
@@ -154,6 +177,27 @@ class _Aborted:
 _CommitPhase = _Attempt | _Committed | _Aborted
 
 
+@dataclass(frozen=True)
+class PublishedWhole:
+    """The payload landed as raw bytes at its payload key."""
+
+
+@dataclass(frozen=True)
+class PublishedChunked:
+    """The payload landed as a manifest; its packs are published."""
+
+
+@dataclass(frozen=True)
+class NotLanded:
+    """The upload definitively did not land — retry with backoff."""
+
+
+# Discriminated publish outcome: the marker's `transport` field DERIVES from
+# this type in `_advance`, so a marker can never claim a transport the publish
+# didn't actually use (the inheritance bug is unrepresentable).
+PublishOutcome = PublishedWhole | PublishedChunked | NotLanded
+
+
 def run_commit(
     store: ObjectStore, base: RootDoc, work: Path, ctx: CommitContext, max_attempts: int
 ) -> CommitResult:
@@ -183,16 +227,28 @@ def _advance(
     target = phase.base.generation + 1
     new_uuid = uuid4()
     ctx.validate(phase.work, phase.base)
-    if not _publish_resolved(store, phase.work, target, new_uuid, phase.attempt, max_attempts):
-        next_attempt = phase.attempt + 1
-        _backoff(next_attempt)
-        return _Attempt(base=phase.base, work=phase.work, attempt=next_attempt)
+    policy = ctx.transport_policy(phase.base)
+    outcome = _publish_resolved(
+        store, phase.work, target, new_uuid, phase.attempt, max_attempts, policy
+    )
+    match outcome:
+        case NotLanded():
+            next_attempt = phase.attempt + 1
+            _backoff(next_attempt)
+            return _Attempt(base=phase.base, work=phase.work, attempt=next_attempt)
+        case PublishedWhole():
+            transport = "whole"
+        case PublishedChunked():
+            transport = "chunked"
     new_doc = phase.base.model_copy(
         update={
             "generation": target,
             "payload_uuid": new_uuid,
             "created_at": datetime.now(tz=UTC),
             "writer": writer_info(),
+            # Derived from the publish outcome above — never inherited from
+            # the base marker, which may have used a different transport.
+            "transport": transport,
         }
     )
 
@@ -212,27 +268,48 @@ def _advance(
 
 
 def _publish_resolved(
-    store: ObjectStore, work: Path, generation: int, new_uuid: UUID, attempt: int, max_attempts: int
-) -> bool:
-    """Upload a generation's bytes, resolving ambiguous outcomes.
+    store: ObjectStore,
+    work: Path,
+    generation: int,
+    new_uuid: UUID,
+    attempt: int,
+    max_attempts: int,
+    policy: TransportPolicy,
+) -> PublishOutcome:
+    """Upload a generation's payload, resolving ambiguous outcomes.
 
-    The upload is create-only to a unique immutable key, so ambiguity resolves
-    with one GET: present means it landed. Returns False when the upload
-    definitively did not land (caller retries with backoff).
+    Whole path: one create-only PUT of the raw bytes. Chunked path (payload at
+    least `policy.chunk_threshold`): build manifest + novel packs deduped
+    against the base manifest, PUT packs, verify/heal them (stalled-writer
+    defense — see chunk.verify_packs), then create-only PUT the manifest at
+    the payload key. Either way the payload key is unique and immutable, so
+    ambiguity resolves with one GET: present means it landed.
     """
     key = format_payload_key(generation, new_uuid)
+    threshold = policy.chunk_threshold
+    if threshold is not None and work.stat().st_size >= threshold:
+        manifest, packs = chunk.build_manifest(
+            work, policy.base_manifest, pack_target=policy.pack_target
+        )
+        chunk.publish_packs(store, packs)
+        chunk.verify_packs(store, manifest, chunk.novel_pack_index(packs))
+        body = manifest.to_bytes()
+        landed: PublishOutcome = PublishedChunked()
+    else:
+        body = work.read_bytes()
+        landed = PublishedWhole()
     try:
-        store.put_if_absent(key, work.read_bytes())
+        store.put_if_absent(key, body)
     except AmbiguousCasError:
         try:
             store.get(key)
         except ObjectNotFoundError:
             if attempt + 1 >= max_attempts:
                 raise ConflictAbortError(
-                    f"catalog upload kept failing across {max_attempts} attempts"
+                    f"payload upload kept failing across {max_attempts} attempts"
                 ) from None
-            return False
-    return True
+            return NotLanded()
+    return landed
 
 
 def create_marker_resolving(
