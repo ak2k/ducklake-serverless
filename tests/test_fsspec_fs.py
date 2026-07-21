@@ -14,7 +14,9 @@ from __future__ import annotations
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false
 # pyright: reportAny=false, reportUnknownArgumentType=false
 # pyright: reportMissingTypeStubs=false
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, override
+from uuid import uuid4
 
 import duckdb
 import pytest
@@ -27,6 +29,7 @@ from ducklake_serverless.blob import BlobStore
 from ducklake_serverless.chunk import PACKS_PREFIX
 from ducklake_serverless.errors import ExternalServiceError
 from ducklake_serverless.fsspec_fs import GenerationFileSystem
+from ducklake_serverless.models import WriterInfo
 from ducklake_serverless.objectstore import InMemoryObjectStore
 from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
@@ -514,3 +517,72 @@ def test_cat_ranges_cold_fanout_fetches_manifest_once(tmp_path: Path) -> None:
     assert got == [DATA[s:e] for s, e in spans]
     # The manifest (payload object) was fetched exactly once, not per worker.
     assert store.full_gets.count(doc.payload_key) == 1
+
+
+def test_cat_contract_guards_pinned(tmp_path: Path) -> None:
+    """The small load-bearing guards, pinned so refactors can't drop them.
+
+    max_gap rejection (base honors it; silent-ignore would change traffic),
+    the empty-input guard (ThreadPoolExecutor(0) raises without it), the
+    end < -size clamp (our python-slice side of the base divergence), and
+    OOB positive bounds.
+    """
+    store = CountingStore()
+    fs = make_chunked_blob(store, tmp_path, DATA)
+
+    with pytest.raises(NotImplementedError):
+        fs.cat_ranges(["head"], [0], [10], max_gap=5)
+    assert fs.cat_ranges([], [], []) == []
+    assert fs.cat_file("head", None, -(len(DATA) + 5)) == b""  # end < -size
+    assert fs.cat_file("head", len(DATA) + 10, len(DATA) + 20) == b""  # start > size
+    assert fs.cat_file("head", len(DATA) - 5, len(DATA) + 999) == DATA[-5:]  # end > size
+
+
+def test_ls_gen_outage_propagates_from_workers(tmp_path: Path) -> None:
+    """A store outage inside the concurrent gen listing must PROPAGATE.
+
+    entry_or_none swallows only FileNotFoundError; a transport failure in a
+    worker surfaces at iteration — an outage never reads as a shorter lake.
+    """
+    store = CountingStore()
+    fs = make_chunked_blob(store, tmp_path, DATA)
+    original = store.get
+
+    def failing_get(key: str):
+        if key == "roots/00000001":  # format_marker_key(1) — zero-padded
+            raise ExternalServiceError("simulated outage")
+        return original(key)
+
+    store.get = failing_get  # type: ignore[method-assign]  # fault injection
+    try:
+        with pytest.raises(ExternalServiceError):
+            fs.ls("gen")
+    finally:
+        store.get = original  # type: ignore[method-assign]
+
+
+def test_marker_missing_payload_size_fails_loud() -> None:
+    """payload_size is REQUIRED: a marker without it is malformed, loudly.
+
+    Greenfield hard-cutover (never deployed): fail-loud beats a silent
+    size-0 default. Pins the tightening itself.
+    """
+    import json  # noqa: PLC0415  # only this test manipulates raw marker JSON
+
+    import pydantic  # noqa: PLC0415  # only this test touches pydantic directly
+
+    from ducklake_serverless.models import RootDoc  # noqa: PLC0415  # only marker-schema test
+
+    doc = RootDoc(
+        generation=1,
+        payload_uuid=uuid4(),
+        created_at=datetime.now(tz=UTC),
+        writer=WriterInfo(lib_version="0", host="t", pid=1),
+        payload_size=123,
+    )
+    raw = doc.to_json_bytes()
+    assert RootDoc.from_json_bytes(raw).payload_size == 123
+    stripped = json.loads(raw)
+    del stripped["payload_size"]
+    with pytest.raises(pydantic.ValidationError):
+        RootDoc.from_json_bytes(json.dumps(stripped).encode())
