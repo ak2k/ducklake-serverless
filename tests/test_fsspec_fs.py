@@ -126,7 +126,8 @@ def test_whole_file_generation_served_by_ranged_gets(tmp_path: Path) -> None:
         # Marker-recorded size (info) and reader-derived size (open) must
         # agree — deb20a4 split these two sources; drift means a writer
         # under-recorded and info()-trusting consumers would truncate.
-        assert fs.info("head")["size"] == f.size == len(DATA)
+        f_size: int = f.size  # pyright: ignore[reportAttributeAccessIssue]  # fsspec types open() as IO; runtime is GenerationFile
+        assert fs.info("head")["size"] == f_size == len(DATA)
         f.seek(1000)
         assert f.read(500) == DATA[1000:1500]
     assert store.range_gets and all(k.startswith("payload/") for k, _, _ in store.range_gets)

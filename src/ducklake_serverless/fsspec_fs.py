@@ -229,6 +229,7 @@ class GenerationFile(AbstractBufferedFile):  # pyright: ignore[reportUntypedBase
         self._reader = reader
         super().__init__(fs, path, mode="rb", size=reader.size, **kwargs)  # pyright: ignore[reportUnknownMemberType]  # untyped fsspec base
 
+    @override
     def _fetch_range(self, start: int, end: int) -> bytes:
         return self._reader.read_range(start, end - start)
 
@@ -262,11 +263,14 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         self._readers: dict[str, _RangeReader] = {}
 
     @classmethod
+    @override
     def _strip_protocol(cls, path: str) -> str:
         # Base strips 'proto://' and trailing '/'; also strip leading '/'
         # (the memory-filesystem pattern) so inherited helpers (_parent,
         # glob machinery) agree with our protocol-free, slash-free names.
-        stripped: str = super()._strip_protocol(path)  # pyright: ignore[reportUnknownMemberType]  # untyped fsspec base
+        stripped = super()._strip_protocol(path)  # pyright: ignore[reportUnknownMemberType]  # untyped fsspec base
+        if not isinstance(stripped, str):  # base returns list only for list input
+            raise InputValidationError("path must be a single string")
         return stripped.lstrip("/")
 
     def pin(self, path: str = "head") -> str:
@@ -315,6 +319,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
             self._readers[doc.payload_key] = reader
         return reader
 
+    @override
     def _open(
         self,
         path: str,
@@ -342,6 +347,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
     def _dir_entry(self, name: str) -> dict[str, Any]:
         return {"name": name, "size": 0, "type": "directory"}
 
+    @override
     def info(self, path: str, **kwargs: Any) -> dict[str, Any]:
         """Size/type for one path (fsspec metadata contract).
 
@@ -363,14 +369,17 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
             "etag": doc.payload_key,
         }
 
+    @override
     def checksum(self, path: str) -> str:  # pyright: ignore[reportIncompatibleMethodOverride]  # base returns int; stable str is strictly more useful and fsspec stringifies it
         """Stable content identity — generations are immutable."""
         return self._resolve(path).payload_key
 
+    @override
     def ukey(self, path: str) -> str:
         """Stable content identity for cache validity (same as checksum)."""
         return self._resolve(path).payload_key
 
+    @override
     def ls(self, path: str = "", detail: bool = True, **kwargs: Any) -> list[Any]:
         """List AT `path` (fsspec contract).
 
@@ -410,6 +419,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         entry = self.info(name)  # a file path: [info(path)] per convention
         return [entry] if detail else [entry["name"]]
 
+    @override
     def cat_file(
         self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any
     ) -> bytes:
@@ -432,6 +442,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
             return b""
         return reader.read_range(s, e - s)
 
+    @override
     def cat_ranges(
         self,
         paths: list[str],
@@ -472,6 +483,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         with ThreadPoolExecutor(max_workers=min(32, len(paths))) as pool:
             return list(pool.map(one, zip(paths, starts_list, ends_list, strict=True)))
 
+    @override
     def exists(self, path: str, **kwargs: Any) -> bool:
         """Whether the path resolves.
 
@@ -487,10 +499,12 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
             return False
         return True
 
+    @override
     def isdir(self, path: str) -> bool:
         """Only the root and `gen` are directories."""
         return self._strip_protocol(path) in ("", "gen")
 
+    @override
     def isfile(self, path: str) -> bool:
         """Whether the path names a resolvable generation file."""
         name = self._strip_protocol(path)
