@@ -253,6 +253,9 @@ def test_lost_cas_after_physical_deletes_stays_consistent(
         def list_prefix(self, prefix: str) -> list[str]:
             return self._inner.list_prefix(prefix)
 
+        def get_range(self, key: str, start: int, length: int) -> bytes:
+            return self._inner.get_range(key, start, length)
+
         def list_meta(self, prefix: str) -> list[ObjectMeta]:
             return self._inner.list_meta(prefix)
 

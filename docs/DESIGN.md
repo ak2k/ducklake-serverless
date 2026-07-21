@@ -32,49 +32,55 @@ Weakening any of these silently breaks a safety proof somewhere else.
    atomic under concurrency; `bootstrap()` probes and refuses backends that
    enforce it only sequentially (iDrive E2) or not at all (garage, `rclone
    serve s3`). Documentation lies; only the live probe tells the truth.
-3. **Transport is marker-declared, never content-sniffed, on the read
+3. **The marker carries per-generation metadata; the payload carries
+   truth.** `transport` and `payload_size` are recorded in the marker at
+   commit time, derived from the publish outcome, never inherited. Size in
+   the marker is METADATA (listings, stream heuristics — no payload round
+   trip); reads derive truth from the payload itself (sha-verified), and a
+   marker/payload size disagreement is a corruption signal, not a tiebreak.
+4. **Transport is marker-declared, never content-sniffed, on the read
    path.** Readers dispatch on `RootDoc.transport`; it is set per commit
    from the publish outcome (`PublishOutcome` union — a marker claiming a
    transport the publish didn't use is unrepresentable). Content sniffing
    exists ONLY in GC's orphan fallback, where a false positive merely
    over-retains.
-4. **Manifest entries are FULL.** Every entry names its pack directly —
+5. **Manifest entries are FULL.** Every entry names its pack directly —
    never delta-to-base. A retained manifest alone suffices to mark every
    pack it depends on.
-5. **The dedup source is strictly the base generation's manifest.** No
+6. **The dedup source is strictly the base generation's manifest.** No
    global index, no other generation. Together with (4) this is the GC
    mark induction: any manifest landing after GC's listing descends through
    committed bases to a marked ancestor; everything novel above it is
    younger than the run and grace-protected.
-6. **Pack deletion is two-cycle.** Unreferenced + store-clock age > grace
+7. **Pack deletion is two-cycle.** Unreferenced + store-clock age > grace
    → tombstone (cycle K, record only); still cold a full grace later →
    delete (cycle K+1), with a pre-delete re-HEAD sparing anything whose
    mtime went young. Referenced-again packs resurrect. The FSM lives in the
    pure `decide_pack_sweep`; refusal and deletion are mutually exclusive by
    type (`RefuseSweep | SweepActions`).
-7. **The tombstone ledger write is fenced and is the commit point.** It is
+8. **The tombstone ledger write is fenced and is the commit point.** It is
    written `put_if_match` against the ETag read at load (create-only when
    absent), BEFORE any delete; a fence failure means a rival GC cycle
    interleaved and the stale cycle aborts with zero deletes. Lease + fence,
    not lease alone.
-8. **All age gates compare store-issued timestamps only.** The runner's
+9. **All age gates compare store-issued timestamps only.** The runner's
    clock never participates (`_store_now` probes the store's clock; same
    discipline as `lease.py`).
-9. **`MIN_PACK_GRACE` (1 h) is load-bearing twice**: it must outlast a
+10. **`MIN_PACK_GRACE` (1 h) is load-bearing twice**: it must outlast a
    stalled writer's packs-landed→manifest-landed gap, AND it dwarfs the
    ~1–2 s whole-second truncation of real stores' LastModified (verified
    against SeaweedFS). Do not lower it on the theory that either concern
    is handled elsewhere.
-10. **Writers self-heal before the manifest lands.** `verify_packs`
+11. **Writers self-heal before the manifest lands.** `verify_packs`
     unconditionally re-PUTs every novel pack (heals swept packs AND
     refreshes mtime for tombstoned-but-doomed ones — the writer half of
     the stalled-writer defense; the GC half is the pre-delete re-HEAD)
     and HEAD-checks base packs, failing the commit loudly if one vanished.
-11. **Deletion-path decisions are pure functions over discriminated
+12. **Deletion-path decisions are pure functions over discriminated
     unions.** `decide_pack_sweep(resolved, metas, tombstones, now)` does no
     I/O; `ResolvedPayload` and `PackSweepPlan` are folded exhaustively —
     an unhandled case is a type error, not a silently unmarked pack.
-12. **The engine core is duckdb-free** — enforced by
+13. **The engine core is duckdb-free** — enforced by
     `tests/test_engine_boundary.py`, not by directory layout.
 
 ## Guardrails on the deletion path

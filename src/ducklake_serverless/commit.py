@@ -181,10 +181,14 @@ _CommitPhase = _Attempt | _Committed | _Aborted
 class PublishedWhole:
     """The payload landed as raw bytes at its payload key."""
 
+    payload_size: int
+
 
 @dataclass(frozen=True)
 class PublishedChunked:
     """The payload landed as a manifest; its packs are published."""
+
+    payload_size: int
 
 
 @dataclass(frozen=True)
@@ -236,9 +240,9 @@ def _advance(
             next_attempt = phase.attempt + 1
             _backoff(next_attempt)
             return _Attempt(base=phase.base, work=phase.work, attempt=next_attempt)
-        case PublishedWhole():
+        case PublishedWhole(payload_size=payload_size):
             transport = "whole"
-        case PublishedChunked():
+        case PublishedChunked(payload_size=payload_size):
             transport = "chunked"
     new_doc = phase.base.model_copy(
         update={
@@ -247,8 +251,9 @@ def _advance(
             "created_at": datetime.now(tz=UTC),
             "writer": writer_info(),
             # Derived from the publish outcome above — never inherited from
-            # the base marker, which may have used a different transport.
+            # the base marker, which may have used a different transport/size.
             "transport": transport,
+            "payload_size": payload_size,
         }
     )
 
@@ -287,17 +292,18 @@ def _publish_resolved(
     """
     key = format_payload_key(generation, new_uuid)
     threshold = policy.chunk_threshold
-    if threshold is not None and work.stat().st_size >= threshold:
+    size = work.stat().st_size
+    if threshold is not None and size >= threshold:
         manifest, packs = chunk.build_manifest(
             work, policy.base_manifest, pack_target=policy.pack_target
         )
         chunk.publish_packs(store, packs)
         chunk.verify_packs(store, manifest, chunk.novel_pack_index(packs))
         body = manifest.to_bytes()
-        landed: PublishOutcome = PublishedChunked()
+        landed: PublishOutcome = PublishedChunked(payload_size=size)
     else:
         body = work.read_bytes()
-        landed = PublishedWhole()
+        landed = PublishedWhole(payload_size=len(body))
     try:
         store.put_if_absent(key, body)
     except AmbiguousCasError:

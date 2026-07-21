@@ -32,6 +32,23 @@ Residue worth keeping here:
   flaky-transport writers (see DESIGN.md residuals), pack compression via
   the manifest's `compression` field.
 
+## Done — fsspec read-adapter with selective reads (2026-07, `work-crn6r`)
+
+`fsspec_fs.GenerationFileSystem` (`[fsspec]` extra): generations as read-only
+file-likes (`head`, `gen/<n>`), with CHUNKED generations served by
+manifest-translated ranged GETs of only the covering pack slices — this
+dissolves the streaming-vs-chunking tradeoff for every fsspec-aware reader
+(plus per-chunk hash verification of fully-covered chunks, which httpfs never
+had). Coalesces contiguous same-pack runs into single GETs. Known limitation,
+verified against duckdb 1.5 + upstream docs: DuckDB's ATTACH opens database
+files through its C++ filesystem only (native + httpfs) and never consults
+registered fsspec filesystems — attaching a chunked catalog still goes through
+local reconstruction (`Lake.reader()`), which is windowed and cached; DuckDB
+*scan* functions (read_parquet/read_csv/read_blob) DO go through the
+filesystem selectively. `cat_file`/`cat_ranges` are overridden to hit the
+range readers directly (no readahead-cache inflation; ranges fan out
+concurrently) — the primitives pyarrow/dask actually batch through.
+
 ## Pre-deployment checklist (before first production lake)
 
 Local drills done 2026-07-20 (see `scripts/soak_crash_drill.py`, rerunnable):
@@ -77,9 +94,6 @@ logical split. Notes when doing it:
   `ATTACH`es the reconstructed file read-only, but no DuckLake semantics
   (wholesale mutation, abort-on-conflict). Low marginal value over `BlobStore`
   + hygiene — demand-gated.
-- **fsspec read-adapter** — expose a generation as a read-only file-like so any
-  fsspec-aware tool (pandas/polars/duckdb) can read it by URL. Falls out of the
-  `Payload.materialize` reconstruction path. Gate behind a `[fsspec]` extra.
 - **CLI** (`[cli]` extra) — `put` / `get` / `history` / `gc` over `BlobStore`
   (and DuckLake). The face that makes this a usable general-purpose utility.
   Add `[project.scripts]`, re-lock `uv.lock`, expose a `nix run .#<cli>` app.

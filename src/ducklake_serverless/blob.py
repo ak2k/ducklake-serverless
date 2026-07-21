@@ -93,6 +93,7 @@ class BlobStore:
             payload_uuid=blob_uuid,
             created_at=datetime.now(tz=UTC),
             writer=commit.writer_info(),
+            payload_size=len(initial),
         )
         match commit.create_marker_resolving(self._store, doc, blob_uuid, 0, self._max_attempts):
             case MarkerOutcome.WON:

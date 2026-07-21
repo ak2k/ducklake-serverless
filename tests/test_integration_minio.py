@@ -369,3 +369,37 @@ def test_chunked_lifecycle_real_s3(prefix: str, tmp_path: Path) -> None:
             continue  # whole-file payloads aren't manifests
     assert referenced <= surviving
     assert bs.read() == bytes((i * 13 + 6) % 251 for i in range(50_000))
+
+
+@requires_minio
+def test_fsspec_selective_reads_real_s3(prefix: str, tmp_path: Path) -> None:
+    """GenerationFileSystem over a real S3 API: range requests served by
+    genuine HTTP Range GETs on pack objects (the semantics the in-memory
+    fake can't prove), byte-exact against the source payload.
+    """
+    # fsspec is untyped (no py.typed) — same facade allowance as fsspec_fs.py.
+    # pyright: ignore comments below are for its open/seek/read surface.
+    from ducklake_serverless.blob import BlobStore  # noqa: PLC0415
+    from ducklake_serverless.fsspec_fs import GenerationFileSystem  # noqa: PLC0415
+
+    store = S3ObjectStore(_client(), BUCKET, prefix=prefix)
+    work = tmp_path / "bw"
+    work.mkdir()
+    bs = BlobStore(store, work, chunk_threshold=0)
+    bs.bootstrap(b"g0")
+    data = bytes((i * 31 + 7) % 251 for i in range(500_000))
+    bs.write(data)
+
+    fs = GenerationFileSystem(store)
+    info = fs.info("head")
+    assert info["transport"] == "chunked"
+    assert info["size"] == len(data)
+
+    # Exact ranges at awkward offsets, straddling chunk and pack boundaries.
+    with fs.open("head", "rb", cache_type="none") as f:  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        for start, n in [(0, 10), (65_530, 100), (131_071, 3), (499_990, 50)]:
+            f.seek(start)  # pyright: ignore[reportUnknownMemberType]
+            assert f.read(n) == data[start : start + n], (start, n)  # pyright: ignore[reportUnknownMemberType]
+    # And a full sequential read through the default readahead cache.
+    with fs.open("head", "rb") as f:  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        assert f.read() == data  # pyright: ignore[reportUnknownMemberType]
