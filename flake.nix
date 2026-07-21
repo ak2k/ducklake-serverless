@@ -185,7 +185,7 @@
             touch $out
           '';
           typos = pkgs.runCommand "check-typos" { nativeBuildInputs = [ pkgs.typos ]; } ''
-            typos ${./src} ${./tests} ${./scripts} ${./README.md} ${./AGENTS.md}
+            typos --config ${./_typos.toml} ${./src} ${./tests} ${./scripts} ${./README.md} ${./AGENTS.md}
             touch $out
           '';
         }

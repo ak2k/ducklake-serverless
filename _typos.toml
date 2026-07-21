@@ -1,0 +1,4 @@
+[default.extend-words]
+# fsspec's AbstractFileSystem class attribute is spelled `cachable` upstream;
+# GenerationFileSystem must use the exact name to opt out of instance caching.
+cachable = "cachable"
