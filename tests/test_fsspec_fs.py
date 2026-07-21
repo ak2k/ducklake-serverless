@@ -441,3 +441,55 @@ def test_multipack_and_dedup_interleaved_geometry(
     # Historic generation reads exactly too (v1's own multi-pack manifest).
     with fs.open("gen/1", "rb", cache_type="none") as f:
         assert f.read() == v1
+
+
+def test_cat_file_exact_slices_and_traffic(tmp_path: Path) -> None:
+    """cat_file bypasses open()'s readahead: exact bytes, ~exact traffic.
+
+    Python-slice semantics per the base contract: negative start/end from
+    EOF, None for either end, empty range -> b"".
+    """
+    store = CountingStore()
+    fs = make_chunked_blob(store, tmp_path, DATA)
+    store.reset_counts()
+
+    assert fs.cat_file("head", 150_000, 154_096) == DATA[150_000:154_096]
+    # No buffered-file layer involved: traffic is the covering slices only.
+    assert 0 < store.pack_bytes_fetched() <= 4096 + 2 * 64 * 1024
+    assert all(not k.startswith(PACKS_PREFIX) for k in store.full_gets)
+
+    assert fs.cat_file("head") == DATA  # both ends open -> whole payload
+    assert fs.cat_file("head", -100) == DATA[-100:]  # negative start
+    assert fs.cat_file("head", 10, -10) == DATA[10:-10]  # negative end
+    assert fs.cat_file("head", -(len(DATA) + 999), 5) == DATA[:5]  # clamped
+    assert fs.cat_file("head", 500, 500) == b""  # empty range
+    assert fs.cat_file("head", 600, 500) == b""  # inverted range
+    with pytest.raises(IsADirectoryError):
+        fs.cat_file("gen")
+    with pytest.raises(FileNotFoundError):
+        fs.cat_file("gen/99")
+
+
+def test_cat_ranges_parallel_many_slices(tmp_path: Path) -> None:
+    """cat_ranges fans out and preserves order + base error semantics."""
+    store = CountingStore()
+    fs = make_chunked_blob(store, tmp_path, DATA)
+
+    spans = [(i * 7_919, i * 7_919 + 512) for i in range(30)]
+    paths = ["head"] * len(spans)
+    got = fs.cat_ranges(paths, [s for s, _ in spans], [e for _, e in spans])
+    assert got == [DATA[s:e] for s, e in spans]
+
+    # Broadcast scalars; strict length check.
+    assert fs.cat_ranges(["head", "head"], 0, 10) == [DATA[:10], DATA[:10]]
+    with pytest.raises(ValueError, match="equal lengths"):
+        fs.cat_ranges(["head"], [0, 1], [10])
+    with pytest.raises(TypeError):
+        fs.cat_ranges("head", 0, 10)  # type: ignore[arg-type]  # base contract: str rejected at runtime
+
+    # on_error="return" collects positionally; "raise" propagates.
+    mixed = fs.cat_ranges(["head", "gen/99"], 0, 10)
+    assert mixed[0] == DATA[:10]
+    assert isinstance(mixed[1], FileNotFoundError)
+    with pytest.raises(FileNotFoundError):
+        fs.cat_ranges(["head", "gen/99"], 0, 10, on_error="raise")

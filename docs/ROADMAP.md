@@ -45,7 +45,9 @@ files through its C++ filesystem only (native + httpfs) and never consults
 registered fsspec filesystems — attaching a chunked catalog still goes through
 local reconstruction (`Lake.reader()`), which is windowed and cached; DuckDB
 *scan* functions (read_parquet/read_csv/read_blob) DO go through the
-filesystem selectively.
+filesystem selectively. `cat_file`/`cat_ranges` are overridden to hit the
+range readers directly (no readahead-cache inflation; ranges fan out
+concurrently) — the primitives pyarrow/dask actually batch through.
 
 ## Pre-deployment checklist (before first production lake)
 

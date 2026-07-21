@@ -410,6 +410,68 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         entry = self.info(name)  # a file path: [info(path)] per convention
         return [entry] if detail else [entry["name"]]
 
+    def cat_file(
+        self, path: str, start: int | None = None, end: int | None = None, **kwargs: Any
+    ) -> bytes:
+        """Bytes [start, end) of one generation — python-slice semantics.
+
+        Overridden to hit the range reader directly: the base implementation
+        goes through open() and its readahead cache (~5 MB prefetched per
+        miss), turning a 16 KiB parquet-footer probe into megabytes of
+        traffic. This is the primitive pyarrow/dask actually call, so it
+        must be exact: one translation, only the covering pack slices.
+        """
+        name = self._strip_protocol(path)
+        if name in ("", "gen"):
+            raise IsADirectoryError(path)
+        reader = self._reader(self._resolve(path))
+        size = reader.size
+        s = 0 if start is None else (start if start >= 0 else max(0, size + start))
+        e = size if end is None else (end if end >= 0 else size + end)
+        if e <= s:
+            return b""
+        return reader.read_range(s, e - s)
+
+    def cat_ranges(
+        self,
+        paths: list[str],
+        starts: int | list[int],
+        ends: int | list[int],
+        max_gap: int | None = None,
+        on_error: str = "return",
+        **kwargs: Any,
+    ) -> list[bytes | Exception]:
+        """Many byte ranges, fetched concurrently (base contract, parallel).
+
+        The base implementation loops cat_file serially; parquet readers
+        issue dozens of column-chunk ranges at once, so fan out — wall-clock
+        stays round-trip-bound. Error semantics match the base: on_error
+        "return" collects exceptions positionally, anything else re-raises.
+        """
+        if max_gap is not None:
+            raise NotImplementedError  # base contract: coalescing hint unsupported
+        if not isinstance(paths, list):  # pyright: ignore[reportUnnecessaryIsInstance]  # base contract: reject str at runtime, untyped callers
+            raise TypeError("paths must be a list")
+        starts_list = starts if isinstance(starts, list) else [starts] * len(paths)
+        ends_list = ends if isinstance(ends, list) else [ends] * len(paths)
+        if len(starts_list) != len(paths) or len(ends_list) != len(paths):
+            raise ValueError("paths, starts and ends must have equal lengths")
+
+        def one(args: tuple[str, int, int]) -> bytes | Exception:
+            p, s, e = args
+            try:
+                return self.cat_file(p, s, e, **kwargs)
+            # Base contract: on_error="return" collects ANY failure positionally.
+            except Exception as exc:
+                if on_error == "return":
+                    return exc
+                raise
+
+        if not paths:
+            return []
+        with ThreadPoolExecutor(max_workers=min(32, len(paths))) as pool:
+            return list(pool.map(one, zip(paths, starts_list, ends_list, strict=True)))
+
     def exists(self, path: str, **kwargs: Any) -> bool:
         """Whether the path resolves.
 
