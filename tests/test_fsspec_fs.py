@@ -28,6 +28,7 @@ from ducklake_serverless.chunk import PACKS_PREFIX
 from ducklake_serverless.errors import ExternalServiceError
 from ducklake_serverless.fsspec_fs import GenerationFileSystem
 from ducklake_serverless.objectstore import InMemoryObjectStore
+from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 
 if TYPE_CHECKING:
@@ -494,3 +495,22 @@ def test_cat_ranges_parallel_many_slices(tmp_path: Path) -> None:
     assert isinstance(mixed[1], FileNotFoundError)
     with pytest.raises(FileNotFoundError):
         fs.cat_ranges(["head", "gen/99"], 0, 10, on_error="raise")
+
+
+def test_cat_ranges_cold_fanout_fetches_manifest_once(tmp_path: Path) -> None:
+    """Concurrent workers on a cold instance share ONE reader construction.
+
+    Without the double-checked lock, N workers racing the empty memo each
+    fetch the manifest — the fan-out would multiply exactly the traffic the
+    memo exists to prevent (review finding).
+    """
+    store = CountingStore()
+    fs = make_chunked_blob(store, tmp_path, DATA)
+    doc, _ = resolve_head(store)
+    store.reset_counts()
+
+    spans = [(i * 7_919, i * 7_919 + 512) for i in range(30)]
+    got = fs.cat_ranges(["head"] * len(spans), [s for s, _ in spans], [e for _, e in spans])
+    assert got == [DATA[s:e] for s, e in spans]
+    # The manifest (payload object) was fetched exactly once, not per worker.
+    assert store.full_gets.count(doc.payload_key) == 1

@@ -65,6 +65,7 @@ import bisect
 import contextlib
 import hashlib
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, override
 
@@ -261,6 +262,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         # (pandas/pyarrow) from downloading a chunked generation's manifest
         # twice — or ls() from downloading one per generation per call.
         self._readers: dict[str, _RangeReader] = {}
+        self._reader_lock = threading.Lock()
 
     @classmethod
     @override
@@ -305,18 +307,26 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
             raise FileNotFoundError(path) from exc
 
     def _reader(self, doc: RootDoc) -> _RangeReader:
+        # Double-checked lock: cat_ranges fans N workers at often ONE path,
+        # and a cold check-then-fetch race would issue up to N duplicate
+        # manifest GETs — defeating the memo exactly on the workload the
+        # fan-out optimizes. Warm hits stay lock-free; the lock only
+        # serializes the first cold construction per payload key.
         reader = self._readers.get(doc.payload_key)
         if reader is None:
-            try:
-                reader = _reader_for(self._store, doc)
-            except NotFoundError as exc:  # payload swept (generation aged out)
-                raise FileNotFoundError(doc.payload_key) from exc
-            except InputValidationError as exc:  # unparseable/oversized manifest
-                raise ExternalServiceError(
-                    f"{doc.payload_key}: committed chunked generation has an "
-                    "unreadable manifest — corrupt payload object"
-                ) from exc
-            self._readers[doc.payload_key] = reader
+            with self._reader_lock:
+                reader = self._readers.get(doc.payload_key)
+                if reader is None:
+                    try:
+                        reader = _reader_for(self._store, doc)
+                    except NotFoundError as exc:  # payload swept (generation aged out)
+                        raise FileNotFoundError(doc.payload_key) from exc
+                    except InputValidationError as exc:  # unparseable/oversized manifest
+                        raise ExternalServiceError(
+                            f"{doc.payload_key}: committed chunked generation has an "
+                            "unreadable manifest — corrupt payload object"
+                        ) from exc
+                    self._readers[doc.payload_key] = reader
         return reader
 
     @override
