@@ -56,6 +56,7 @@ def _root() -> RootDoc:
         payload_uuid=uuid4(),
         created_at=datetime.now(tz=UTC),
         writer=WriterInfo(lib_version="0.1.0", host="test", pid=1),
+        payload_size=0,
     )
 
 

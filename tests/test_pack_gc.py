@@ -72,6 +72,7 @@ def doc(gen: int, transport: str = "chunked") -> RootDoc:
         payload_uuid=uuid4(),
         created_at=NOW,
         writer=WriterInfo(lib_version="0", host="t", pid=1),
+        payload_size=0,
         transport=transport,  # pyright: ignore[reportArgumentType]
     )
 

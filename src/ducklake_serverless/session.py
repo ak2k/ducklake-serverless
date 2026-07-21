@@ -210,6 +210,7 @@ class Lake:
                 payload_uuid=payload_uuid,
                 created_at=datetime.now(tz=UTC),
                 writer=writer_info(),
+                payload_size=catalog_path.stat().st_size,
                 pins={
                     _PIN_DUCKDB_VERSION: DUCKDB_VERSION,
                     _PIN_DUCKLAKE_FORMAT: probe_ducklake_format_version(catalog_path),

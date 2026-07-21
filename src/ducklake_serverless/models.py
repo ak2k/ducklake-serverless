@@ -112,8 +112,10 @@ class RootDoc(BaseModel):
     # heuristics read it marker-only instead of fetching the payload/manifest;
     # reads still derive truth from the payload itself (sha-verified), and a
     # disagreement is a corruption signal. Derived from the publish outcome,
-    # never inherited.
-    payload_size: int = Field(default=0, ge=0)
+    # never inherited. REQUIRED (no default): a construction site that
+    # forgets it must fail to type-check, not silently record 0 — size 0 is
+    # a real value (empty payload), not an "unknown" sentinel.
+    payload_size: int = Field(ge=0)
 
     @property
     def payload_key(self) -> str:

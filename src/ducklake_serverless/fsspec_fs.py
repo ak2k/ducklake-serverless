@@ -65,6 +65,7 @@ import bisect
 import contextlib
 import hashlib
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, override
 
 from fsspec import AbstractFileSystem  # pyright: ignore[reportMissingImports]  # no py.typed
@@ -219,14 +220,14 @@ def _reader_for(store: ObjectStore, doc: RootDoc) -> _RangeReader:
             return _ChunkedReader(store, chunk.load_manifest(store, doc.payload_key))
 
 
-class GenerationFile(AbstractBufferedFile):  # pyright: ignore[reportUntypedBaseClass]
+class GenerationFile(AbstractBufferedFile):  # pyright: ignore[reportUntypedBaseClass]  # fsspec ships no py.typed
     """Read-only buffered file over one generation (fsspec plumbing)."""
 
     def __init__(
         self, fs: GenerationFileSystem, path: str, reader: _RangeReader, **kwargs: Any
     ) -> None:
         self._reader = reader
-        super().__init__(fs, path, mode="rb", size=reader.size, **kwargs)  # pyright: ignore[reportUnknownMemberType]
+        super().__init__(fs, path, mode="rb", size=reader.size, **kwargs)  # pyright: ignore[reportUnknownMemberType]  # untyped fsspec base
 
     def _fetch_range(self, start: int, end: int) -> bytes:
         return self._reader.read_range(start, end - start)
@@ -252,7 +253,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
     cachable = False
 
     def __init__(self, store: ObjectStore, **kwargs: Any) -> None:
-        super().__init__(**kwargs)  # pyright: ignore[reportUnknownMemberType]
+        super().__init__(**kwargs)  # pyright: ignore[reportUnknownMemberType]  # untyped fsspec base
         self._store = store
         # Readers memoized per payload key: generations are immutable, so
         # this is trivially correct, and it stops the info-then-open pattern
@@ -265,7 +266,7 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         # Base strips 'proto://' and trailing '/'; also strip leading '/'
         # (the memory-filesystem pattern) so inherited helpers (_parent,
         # glob machinery) agree with our protocol-free, slash-free names.
-        stripped: str = super()._strip_protocol(path)  # pyright: ignore[reportUnknownMemberType]
+        stripped: str = super()._strip_protocol(path)  # pyright: ignore[reportUnknownMemberType]  # untyped fsspec base
         return stripped.lstrip("/")
 
     def pin(self, path: str = "head") -> str:
@@ -374,9 +375,10 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
         """List AT `path` (fsspec contract).
 
         Root -> head + the gen/ directory; gen -> generation entries; a file
-        path -> that entry alone. Unreadable individual generations (swept payloads, corrupt
-        manifests) are omitted in BOTH detail modes; transport failures
-        propagate — an outage must not masquerade as an empty lake.
+        path -> that entry alone. Listing is MARKER-ONLY (size and transport
+        come from the marker), so even a generation whose payload is swept or
+        corrupt still lists — reads tell the truth about it. Transport
+        failures propagate — an outage must not masquerade as an empty lake.
         """
         name = self._strip_protocol(path)
         if name == "":
@@ -390,12 +392,20 @@ class GenerationFileSystem(AbstractFileSystem):  # pyright: ignore[reportUntyped
                 head_doc, _ = resolve_head(self._store)
             except NotFoundError as exc:
                 raise FileNotFoundError(path) from exc
-            gens: list[dict[str, Any]] = []
-            for g in range(head_doc.generation + 1):
+
+            # Markers are immortal, so this listing grows with lake age;
+            # fetch them concurrently — wall-clock stays round-trip-bound
+            # instead of generations x round-trip.
+            def entry_or_none(g: int) -> dict[str, Any] | None:
                 try:
-                    gens.append(self.info(f"gen/{g}"))
-                except (FileNotFoundError, InputValidationError):
-                    continue  # swept payload or corrupt manifest — omit
+                    return self.info(f"gen/{g}")
+                except FileNotFoundError:
+                    return None  # marker gone (should not happen) — omit
+
+            count = head_doc.generation + 1
+            with ThreadPoolExecutor(max_workers=min(32, count)) as pool:
+                maybe = list(pool.map(entry_or_none, range(count)))
+            gens = [e for e in maybe if e is not None]
             return gens if detail else [e["name"] for e in gens]
         entry = self.info(name)  # a file path: [info(path)] per convention
         return [entry] if detail else [entry["name"]]

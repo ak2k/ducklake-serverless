@@ -123,6 +123,10 @@ def test_whole_file_generation_served_by_ranged_gets(tmp_path: Path) -> None:
     fs = GenerationFileSystem(store)
     store.reset_counts()
     with fs.open("head", "rb") as f:
+        # Marker-recorded size (info) and reader-derived size (open) must
+        # agree — deb20a4 split these two sources; drift means a writer
+        # under-recorded and info()-trusting consumers would truncate.
+        assert fs.info("head")["size"] == f.size == len(DATA)
         f.seek(1000)
         assert f.read(500) == DATA[1000:1500]
     assert store.range_gets and all(k.startswith("payload/") for k, _, _ in store.range_gets)
@@ -298,9 +302,10 @@ def test_transport_outage_is_not_absence(tmp_path: Path) -> None:
         store.get = original  # type: ignore[method-assign]
 
 
-def test_corrupt_manifest_omitted_from_ls_not_poisoning(tmp_path: Path) -> None:
-    """One corrupt manifest must not poison the whole listing (review
-    finding: InputValidationError escaped ls's catch)."""
+def test_corrupt_manifest_listed_marker_only_fails_at_read(tmp_path: Path) -> None:
+    """Listing is marker-only, so a corrupt manifest still lists (and never
+    poisons the listing — the original review finding); the corruption
+    surfaces loudly at open/read instead."""
     store = InMemoryObjectStore()
     work = tmp_path / "w"
     work.mkdir()

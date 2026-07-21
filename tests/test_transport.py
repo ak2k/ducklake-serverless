@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 from ducklake_serverless import chunk as chunk_mod
+from ducklake_serverless import session as session_mod
 from ducklake_serverless.blob import BlobStore
 from ducklake_serverless.chunk import MANIFEST_MAGIC, PACKS_PREFIX
+from ducklake_serverless.engine import S3Credentials
 from ducklake_serverless.errors import ExternalServiceError
 from ducklake_serverless.models import RootDoc
-from ducklake_serverless.objectstore import InMemoryObjectStore
+from ducklake_serverless.objectstore import InMemoryObjectStore, S3ObjectStore
 from ducklake_serverless.root import resolve_head
 from ducklake_serverless.session import Lake
 
@@ -193,3 +195,87 @@ def test_chunk_size_rescale_boundary_end_to_end(
     shared = {e.pack_sha256 for e in m2.entries} & {e.pack_sha256 for e in m3.entries}
     assert shared  # dedup resumed after the rescale generation
     assert bs.read() == bytes(edited)
+
+
+def test_payload_size_recorded_by_every_writer_path(
+    store: InMemoryObjectStore, tmp_path: Path
+) -> None:
+    """Every marker writer records the TRUE logical payload size.
+
+    payload_size is written by four paths (blob bootstrap, lake bootstrap,
+    whole commit, chunked commit) and consumed marker-only by listings and
+    the stream heuristic — an under-recording writer would make healthy
+    generations read as empty through info()-trusting consumers (review
+    finding: the lake bootstrap omitted it and defaulted to 0).
+    """
+    bs = make_blob(store, tmp_path, threshold=100_000)
+    initial = b"gen0-initial"
+    bs.bootstrap(initial)
+    assert head(store).payload_size == len(initial)
+
+    small = b"w" * 1_000  # below threshold: whole
+    bs.write(small)
+    doc = head(store)
+    assert doc.transport == "whole"
+    assert doc.payload_size == len(small)
+    assert doc.payload_size == len(store.get(doc.payload_key).body)
+
+    big = bytes(i % 251 for i in range(200_000))  # above threshold: chunked
+    bs.write(big)
+    doc = head(store)
+    assert doc.transport == "chunked"
+    assert doc.payload_size == len(big)  # logical size, NOT the manifest's
+    manifest = chunk_mod.load_manifest(store, doc.payload_key)
+    assert doc.payload_size == manifest.total_size
+
+
+def test_lake_bootstrap_records_gen0_payload_size(
+    store: InMemoryObjectStore, tmp_path: Path
+) -> None:
+    """Gen 0 of a DuckLake is a real catalog file — its marker must say so."""
+    data = tmp_path / "data"
+    data.mkdir()
+    work = tmp_path / "work"
+    work.mkdir()
+    lake = Lake(store, workdir=work, data_path=str(data))
+    lake.bootstrap()
+    doc = head(store)
+    assert doc.generation == 0
+    assert doc.payload_size > 0
+    assert doc.payload_size == len(store.get(doc.payload_key).body)
+
+
+def test_stream_auto_heuristic_reads_marker_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The auto heuristic gates on marker payload_size — both branches.
+
+    Hermetic via moto: the S3-store + credentials gates precede the size
+    check, so an InMemory store can never reach it (review finding: the
+    stream-because-large branch had zero coverage in any lane).
+    """
+    import boto3  # noqa: PLC0415  # moto-lane dep, kept out of module import cost
+    from moto import mock_aws  # noqa: PLC0415  # moto-lane dep
+
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")  # pyright: ignore[reportUnknownMemberType]  # boto3.client factory is untyped
+        client.create_bucket(Bucket="stream-test")
+        s3_store = S3ObjectStore(client, "stream-test", prefix="lake")
+        data = tmp_path / "data"
+        data.mkdir()
+        work = tmp_path / "work"
+        work.mkdir()
+        creds = S3Credentials(access_key_id="test", secret_access_key="test")  # noqa: S106  # moto dummy creds
+        lake = Lake(s3_store, workdir=work, data_path=str(data), s3_credentials=creds)
+        lake.bootstrap()
+        doc, _ = resolve_head(s3_store)
+        assert doc.transport == "whole"
+        assert doc.payload_size > 0
+
+        monkeypatch.setattr(session_mod, "STREAM_MIN_BYTES", 1)
+        stream_store = lake._stream_store("auto")  # pyright: ignore[reportPrivateUsage]
+        assert stream_store is s3_store  # large enough → stream
+
+        monkeypatch.setattr(session_mod, "STREAM_MIN_BYTES", doc.payload_size + 1)
+        stream_store = lake._stream_store("auto")  # pyright: ignore[reportPrivateUsage]
+        assert stream_store is None  # below the floor → download
