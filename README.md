@@ -60,6 +60,70 @@ a test that imports every engine-core module in a fresh interpreter and asserts
   pinning. Each generation is a complete, stock DuckLake catalog readable by any
   DuckLake-aware tool via `ATTACH 'ducklake:…' (READ_ONLY)`.
 
+Large payloads commit as **content-addressed chunks** (fixed-offset chunks in
+~8 MiB packs, deduplicated against the previous generation), so an
+offset-stable edit to a big payload — the shape of DuckDB/SQLite block writes
+— uploads and stores only the novel bytes. (Fixed-offset means an insertion
+that *shifts* content re-chunks everything after it; the design is tuned for
+database files, not documents.) The `[fsspec]` extra adds a read-only
+filesystem with **selective reads** over chunked generations — any byte range
+costs only the pack slices that cover it, with every fully-covered chunk
+hash-verified (partial edge chunks can't be — there are no whole-chunk bytes
+to hash).
+
+## Positioning — when to use this, and when not to
+
+**Use Delta Lake (delta-rs) if your problem is "tables on S3."** It is mature,
+multi-writer on plain S3 (via the same conditional-write primitive), and read
+by everything — Spark, polars, pandas, DuckDB itself. This project does not
+compete with that, and a table-append benchmark won't change the answer.
+
+This project is for two problems Delta doesn't address:
+
+1. **A mutable *database* on S3, not a table.** Delta versions tables; it has
+   no story for an arbitrary DuckDB/SQLite file — views, macros, schema and
+   all — or any other opaque artifact. `BlobStore` gives any payload atomic
+   multi-writer versioning with time travel, on S3 alone. That's a different
+   category, not a faster horse.
+2. **Serverless multi-writer DuckLake.** DuckLake's own argument against
+   Delta/Iceberg is that lakehouse metadata belongs in a real database (no
+   JSON-log compaction, no file-listing walls, cross-table transactions).
+   But upstream multi-writer DuckLake requires a database server (Postgres,
+   per its own recommendation) —
+   surrendering "just a bucket" exactly where Delta keeps it. This transport
+   closes that gap: the catalog database itself becomes the versioned
+   payload, and the whole lakehouse — catalog included — is one S3 prefix.
+
+The trade is explicit and inherited from DuckLake's design, and we'd choose
+it anyway: **one catalog = one commit chain**. What that buys:
+
+- **Cross-table ACID.** One transaction can touch many tables; one marker CAS
+  commits them all. Delta on plain S3 cannot span two tables atomically (each
+  table's log is its own commit domain; catalog-managed Delta can, but that
+  reintroduces a catalog service); Iceberg likewise needs catalog-level
+  support for it.
+- **Whole-database time travel.** `gen/<n>` is a mutually consistent snapshot
+  of *every* table, not per-table version vectors you correlate by hand.
+- **One correctness story.** A single linear generation chain is the anchor
+  for the commit protocol, chunk dedup, and GC safety proofs.
+
+What it costs: writers to *disjoint* tables still contend on one marker —
+Delta commits them in parallel, we serialize them (the loser rebases cheaply;
+chunking means a retry re-uploads only novel bytes). At this design point — a
+compact catalog, a handful of writers, zero services — contention is S3 round
+trips, not a bottleneck. If you need truly independent write domains, run two
+lakes: that's Delta's granularity, with the boundary made explicit.
+
+Nearby systems, for orientation: **sqlite-s3vfs** reads a database from S3 by
+range but has no multi-writer commit story; **Litestream** replicates a single
+writer; **s3ql** checkpoints its metadata database to the bucket but must
+enforce a single mount for exactly that reason; **JuiceFS** achieves
+multi-writer POSIX-over-S3 by reintroducing a metadata service (Redis et al.)
+— the dependency this design exists to avoid; **DynamoDB commit coordination**
+(what Delta-on-S3 required before S3 grew conditional writes) is the sidecar
+that `If-None-Match` made unnecessary — this project is a bet on that
+primitive, all the way down.
+
 ## Usage — BlobStore (any payload)
 
 ```python
