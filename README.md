@@ -88,11 +88,12 @@ This project is for two problems Delta doesn't address:
 2. **Serverless multi-writer DuckLake.** DuckLake's own argument against
    Delta/Iceberg is that lakehouse metadata belongs in a real database (no
    JSON-log compaction, no file-listing walls, cross-table transactions).
-   But upstream multi-writer DuckLake requires a database server (Postgres,
-   per its own recommendation) —
-   surrendering "just a bucket" exactly where Delta keeps it. This transport
-   closes that gap: the catalog database itself becomes the versioned
-   payload, and the whole lakehouse — catalog included — is one S3 prefix.
+   But upstream multi-writer DuckLake requires a database server — Postgres
+   per its own recommendation, or, since May 2026, a DuckDB instance fronted
+   by the Quack protocol — surrendering "just a bucket" exactly where Delta
+   keeps it. This transport closes that gap: the catalog database itself
+   becomes the versioned payload, and the whole lakehouse — catalog
+   included — is one S3 prefix.
 
 The trade is explicit and inherited from DuckLake's design, and we'd choose
 it anyway: **one catalog = one commit chain**. What that buys:
@@ -114,15 +115,18 @@ compact catalog, a handful of writers, zero services — contention is S3 round
 trips, not a bottleneck. If you need truly independent write domains, run two
 lakes: that's Delta's granularity, with the boundary made explicit.
 
-Nearby systems, for orientation: **sqlite-s3vfs** reads a database from S3 by
-range but has no multi-writer commit story; **Litestream** replicates a single
-writer; **s3ql** checkpoints its metadata database to the bucket but must
-enforce a single mount for exactly that reason; **JuiceFS** achieves
-multi-writer POSIX-over-S3 by reintroducing a metadata service (Redis et al.)
-— the dependency this design exists to avoid; **DynamoDB commit coordination**
-(what Delta-on-S3 required before S3 grew conditional writes) is the sidecar
-that `If-None-Match` made unnecessary — this project is a bet on that
-primitive, all the way down.
+Nearby systems, for orientation: **DuckDB Quack** (beta in v1.5.3) turns one
+DuckDB process into an HTTP server many clients share — the DuckDB-native
+answer to the same multi-writer question, and still a server: one owning
+process, no horizontal write scaling, failover left to the operator;
+**sqlite-s3vfs** reads a database from S3 by range but has no multi-writer
+commit story; **Litestream** replicates a single writer; **s3ql** checkpoints
+its metadata database to the bucket but must enforce a single mount for
+exactly that reason; **JuiceFS** achieves multi-writer POSIX-over-S3 by
+reintroducing a metadata service (Redis et al.) — the dependency this design
+exists to avoid; **DynamoDB commit coordination** (what Delta-on-S3 required
+before S3 grew conditional writes) is the sidecar that `If-None-Match` made
+unnecessary — this project is a bet on that primitive, all the way down.
 
 ## Usage — BlobStore (any payload)
 
