@@ -103,6 +103,39 @@ logical split. Notes when doing it:
 - **Naming / positioning** — the project is now an engine with DuckLake as one
   adapter; `ducklake-serverless` is really the adapter name. Decide the public
   project name before any release.
+  - One candidate framing, undecided: **a serverless CAS-coordination engine,
+    with DuckLake as its flagship adapter.** The engine already supplies most
+    of what people stand up ZooKeeper / etcd / Raft to get: a linearizable,
+    dense, append-only log (`roots/<gen>`, every slot claimed exactly once,
+    never rewritten) and a monotonic fencing token (the generation number) —
+    both consequences of the commit CAS, not features bolted onto it. The
+    third piece is `probe_capabilities` + the compatibility table, which
+    answer "does this endpoint actually enforce conditional writes *under
+    concurrency*" — the half that homegrown S3 locks skip entirely, and the
+    half that is expensive to get right. Exposing log + fencing token + probe
+    as engine-level entrypoints is mostly naming and docs, not new code.
+  - The boundary is the credibility, and would have to be stated as loudly as
+    the capability: no watches (S3 has no push — everything polls), S3
+    round-trip latency rather than sub-millisecond, no membership or liveness
+    beyond a TTL, and no fencing on anyone's *serving* path — a demoted holder
+    can still answer stale reads, which is client routing and not ours. A
+    different point on the curve from Raft, not a replacement for it.
+  - Deliberately outside any such surface: `lease.py` as a general-purpose
+    distributed lock. It is correct for GC *because* overlapping sweeps are
+    idempotent (its own docstring leads with the requirement); published under
+    a lock-shaped name, callers will take it for mutual exclusion without
+    reading the contract. Leader election likewise stays unshipped — the CAS
+    already fences writes without a lease that can be wrong, and an API by
+    that name would imply a split-brain guarantee this layer cannot deliver.
+  - Motivating consumer (2026-08): HA for a DuckDB catalog served over
+    Quack — DuckDB's client/server protocol, beta in v1.5.3, whose DuckLake
+    integration reintroduces exactly the single-writer server this project
+    positions against. Such a wrapper needs a fencing token, an "overtaken"
+    signal, and reconstruct-from-latest; all three exist today. Known
+    obstacle before believing that story: `check_hygiene` requires a cleanly
+    checkpointed, WAL-free file, so publishing from a live server means a
+    CHECKPOINT + brief write-quiesce per generation. Prototype that window
+    before designing around it.
 - A broadly-adopted CLI utility (à la restic/litestream) would ideally be a
   single static binary; Python is right for now given the DuckLake dependency
   and the existing tested codebase, but note the tension.
