@@ -91,9 +91,12 @@ This project is for two problems Delta doesn't address:
    But upstream multi-writer DuckLake requires a database server — Postgres
    per its own recommendation, or, since May 2026, a DuckDB instance fronted
    by the Quack protocol — surrendering "just a bucket" exactly where Delta
-   keeps it. This transport closes that gap: the catalog database itself
-   becomes the versioned payload, and the whole lakehouse — catalog
-   included — is one S3 prefix.
+   keeps it. Quack makes that server lighter, not absent: still a process to
+   provision, size, monitor and fail over, still the holder of the
+   object-store credentials, still one owning process with no replication
+   protocol shipped — and it cannot be a Lambda. This transport closes the
+   gap instead: the catalog database itself becomes the versioned payload,
+   and the whole lakehouse — catalog included — is one S3 prefix.
 
 The trade is explicit and inherited from DuckLake's design, and we'd choose
 it anyway: **one catalog = one commit chain**. What that buys:

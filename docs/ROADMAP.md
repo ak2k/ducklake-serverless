@@ -102,40 +102,73 @@ logical split. Notes when doing it:
 
 - **Naming / positioning** — the project is now an engine with DuckLake as one
   adapter; `ducklake-serverless` is really the adapter name. Decide the public
-  project name before any release.
-  - One candidate framing, undecided: **a serverless CAS-coordination engine,
-    with DuckLake as its flagship adapter.** The engine already supplies most
-    of what people stand up ZooKeeper / etcd / Raft to get: a linearizable,
-    dense, append-only log (`roots/<gen>`, every slot claimed exactly once,
-    never rewritten) and a monotonic fencing token (the generation number) —
-    both consequences of the commit CAS, not features bolted onto it. The
-    third piece is `probe_capabilities` + the compatibility table, which
-    answer "does this endpoint actually enforce conditional writes *under
-    concurrency*" — the half that homegrown S3 locks skip entirely, and the
-    half that is expensive to get right. Exposing log + fencing token + probe
-    as engine-level entrypoints is mostly naming and docs, not new code.
-  - The boundary is the credibility, and would have to be stated as loudly as
-    the capability: no watches (S3 has no push — everything polls), S3
-    round-trip latency rather than sub-millisecond, no membership or liveness
-    beyond a TTL, and no fencing on anyone's *serving* path — a demoted holder
-    can still answer stale reads, which is client routing and not ours. A
-    different point on the curve from Raft, not a replacement for it.
-  - Deliberately outside any such surface: `lease.py` as a general-purpose
-    distributed lock. It is correct for GC *because* overlapping sweeps are
-    idempotent (its own docstring leads with the requirement); published under
-    a lock-shaped name, callers will take it for mutual exclusion without
-    reading the contract. Leader election likewise stays unshipped — the CAS
-    already fences writes without a lease that can be wrong, and an API by
-    that name would imply a split-brain guarantee this layer cannot deliver.
-  - Motivating consumer (2026-08): HA for a DuckDB catalog served over
-    Quack — DuckDB's client/server protocol, beta in v1.5.3, whose DuckLake
-    integration reintroduces exactly the single-writer server this project
-    positions against. Such a wrapper needs a fencing token, an "overtaken"
-    signal, and reconstruct-from-latest; all three exist today. Known
-    obstacle before believing that story: `check_hygiene` requires a cleanly
-    checkpointed, WAL-free file, so publishing from a live server means a
-    CHECKPOINT + brief write-quiesce per generation. Prototype that window
-    before designing around it.
+  project name before any release. One candidate framing is worked out in
+  "Open — positioning: a coordination engine?" below.
 - A broadly-adopted CLI utility (à la restic/litestream) would ideally be a
   single static binary; Python is right for now given the DuckLake dependency
   and the existing tested codebase, but note the tension.
+
+## Open — positioning: a coordination engine?
+
+A candidate answer to the naming question above. Undecided; recorded so the
+argument does not have to be rebuilt from scratch.
+
+**The framing:** a serverless CAS-coordination engine, with DuckLake as its
+flagship adapter. The engine already supplies most of what people stand up
+ZooKeeper / etcd / Raft to get: a linearizable, dense, append-only log
+(`roots/<gen>`, every slot claimed exactly once, never rewritten) and a
+fencing capability — both consequences of the commit CAS, not features
+bolted onto it. The third piece is `probe_capabilities` + the compatibility
+table, which answer "does this endpoint actually enforce conditional writes
+*under concurrency*" — the half that homegrown S3 locks skip entirely, and
+the half that is expensive to get right.
+
+**What the fencing capability actually is.** Not the generation number: that
+is a public value anyone can read, and possession of a non-exclusive value
+fences nothing. The exclusive capability is *having won the create of
+generation N*, evidenced by the marker's uuid — ours means WON forever
+(`root.resolve_marker`). The token is the `(generation, uuid)` pair. It
+fences writes to THIS chain; it does not fence a third-party resource unless
+that resource participates in the same check.
+
+**The boundary is the credibility**, and would have to be stated as loudly as
+the capability: no watches (S3 has no push — everything polls), S3
+round-trip latency rather than sub-millisecond, no membership at all and
+liveness only as far as a lease TTL implies it, and no fencing on anyone's
+*serving* path — a demoted holder can still answer stale reads, which is
+client routing and not ours. A different point on the curve from Raft, not a
+replacement for it.
+
+**Deliberately outside any such surface:** `lease.py` as a general-purpose
+distributed lock. It is correct for GC *because* overlapping sweeps are
+idempotent (its own docstring leads with the requirement); published under a
+lock-shaped name, callers will take it for mutual exclusion without reading
+the contract. Leader election likewise stays unshipped — the CAS already
+fences writes without a lease that can be wrong, and an API by that name
+would imply a split-brain guarantee this layer cannot deliver.
+
+**What it would cost:** less than a subsystem, more than a rename.
+`probe_capabilities` is already public, but `BlobStore` exposes
+write/read/head — not "claim slot N with my token" — and slot-claiming lives
+inside `commit.py` today. The log-as-primitive needs real surface.
+
+### Motivating consumer (2026-08): HA for a Quack-served catalog
+
+Quack is DuckDB's client/server protocol (beta in v1.5.3); its DuckLake
+integration reintroduces the single-owning-process server this project
+positions against, with no replication protocol shipped. A wrapper giving it
+HA needs a fencing token, an "overtaken" signal, and reconstruct-from-latest.
+
+The trap, and the reason this is not just wiring: **the overtaken signal only
+exists under `ConflictPolicy.ABORT_ALL`.** Under the default policy
+`run_commit` rebases onto the head until won, so a blind append that loses a
+race is retried rather than reported — a demoted primary would keep
+committing forever, interleaved with the real one, and never learn it lost.
+The engine's headline feature, making lost races invisible to concurrent
+writers, is exactly what makes single-primary HA undetectable. An HA path
+must opt out of it.
+
+Second obstacle, load-bearing before any of this is believable:
+`check_hygiene` requires a cleanly checkpointed, WAL-free file, so publishing
+from a live server means a CHECKPOINT plus a brief write-quiesce per
+generation. Measure that window first — if it is fat, the rest is moot.
